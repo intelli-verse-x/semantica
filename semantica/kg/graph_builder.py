@@ -16,14 +16,14 @@ Key Features:
 Example Usage:
     >>> from semantica.kg import GraphBuilder
     >>> builder = GraphBuilder(merge_entities=True, resolve_conflicts=True)
-    >>> graph = builder.build(sources=[{"entities": [...], "relationships": [...]}])
+    >>> graph = builder.build(sources=[{"entities": [...], "relationships": [...]}])  # doctest: +SKIP
 
 Author: Semantica Contributors
 License: MIT
 """
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import time
 
 
@@ -89,7 +89,51 @@ class GraphBuilder:
         self.track_history = track_history
         self.version_snapshots = version_snapshots
         self.graph_store = graph_store
-        self.config = kwargs  # Store additional config for extractors
+        # The orchestrator builds with GraphBuilder(config=self.config.get("kg", {})).
+        # That lands as a nested "config" keyword, so fold it into the option
+        # mapping once here: every option ({entity_resolution,
+        # conflict_detection, unknown_relation_endpoint, ...}) is then read the
+        # same way whether it was given top-level or via the orchestrator path.
+        kwargs = dict(kwargs)
+        _nested = kwargs.pop("config", None)
+        if isinstance(_nested, dict):
+            for _key, _value in _nested.items():
+                kwargs.setdefault(_key, _value)
+        # Screening options belong to this boundary, not to extraction backends.
+        self._screening_options = {
+            "screening": kwargs.pop("screening", False),
+            "screening_method": kwargs.pop("screening_method", "baseline"),
+            "screening_mode": kwargs.pop("screening_mode", "annotate"),
+        }
+        self._screening_reports: List[Dict[str, Any]] = []
+        self._screened_text_count = 0
+        self.config = kwargs
+        # unknown_relation_endpoint lives in the per-module build config
+        # (semantica/kg/config.py); fall back to it so the option has a single
+        # documented home. Popped out of kwargs so it is not forwarded to
+        # extractors as an unused **config key.
+        from .config import kg_config
+
+        self.unknown_relation_endpoint = kwargs.pop(
+            "unknown_relation_endpoint",
+            kg_config.get_method_config("build").get(
+                "unknown_relation_endpoint", "include"
+            ),
+        )
+        # Extractors are reused across texts: NERExtractor loads its spaCy model
+        # eagerly in __init__, so constructing one per text would reload the
+        # model on every source in a multi-document build.
+        self._extractor_cache: Dict[Tuple[str, Any], Any] = {}
+        # build() resets these per run; seed them here so _extract_from_text
+        # is usable on its own instead of raising an AttributeError that the
+        # broad except in the extraction path silently swallows.
+        self._extraction_stats: Dict[str, int] = {
+            "extracted_entities": 0,
+            "extracted_relations": 0,
+            "extracted_triplets": 0,
+        }
+        # Counts relationships dropped by the reject policy per build() call.
+        self._rejected_relationships: int = 0
 
         # Initialize logging
         from ..utils.logging import get_logger
@@ -131,6 +175,23 @@ class GraphBuilder:
 
     def _process_item(self, item: Any, all_entities: List[Any], all_relationships: List[Any], **options):
         """Helper to process a single item and add to entities or relationships list."""
+        from ..ingest.file_ingestor import FileObject
+
+        if isinstance(item, FileObject):
+            content = item.content or ""
+            if isinstance(content, bytes):
+                # Binary formats (images, PDF, Office) need a parser, not raw decoding.
+                try:
+                    content = content.decode("utf-8")
+                except UnicodeDecodeError:
+                    self.logger.warning(
+                        "Skipping FileObject %r: %s content is not UTF-8 text",
+                        item.name,
+                        item.file_type,
+                    )
+                    return
+            item = content
+
         if isinstance(item, str):
             # Treat string as text for extraction
             self._extract_from_text(item, all_entities, all_relationships, **options)
@@ -147,9 +208,81 @@ class GraphBuilder:
             }
             all_entities.append(entity_dict)
         elif hasattr(item, "subject") and hasattr(item, "predicate") and hasattr(item, "object"):
-            # It's likely a Relation object
+            # It's likely a Relation or Triplet object
             subj = item.subject
             obj = item.object
+            # Relation extraction synthesizes an UNKNOWN Entity for an endpoint
+            # that is absent from the NER entity list (metadata synthetic=True).
+            # Triplet extraction does the same, but its endpoints are strings, so
+            # the extractor records the absent endpoint texts instead. Only the
+            # id/text survives in the relationship today, so the synthetic object
+            # never reaches the entity collection and graph validation reports
+            # DANGLING_EDGE. Promote those endpoint entities into the graph here.
+            item_metadata = getattr(item, "metadata", None) or {}
+            # Triplet LLM path tags endpoint texts it could not match to an entity.
+            triplet_synthetic = [
+                text
+                for text in item_metadata.get("synthetic_endpoints", [])
+                if isinstance(text, str)
+            ]
+            synthetic_endpoints = []
+            for endpoint in (subj, obj):
+                if (
+                    not isinstance(endpoint, str)
+                    and isinstance(getattr(endpoint, "metadata", None), dict)
+                    and endpoint.metadata.get("synthetic")
+                ):
+                    synthetic_endpoints.append(endpoint)
+                elif isinstance(endpoint, str) and endpoint in triplet_synthetic:
+                    synthetic_endpoints.append(endpoint)
+            if synthetic_endpoints:
+                endpoint_policy = self.unknown_relation_endpoint
+                if endpoint_policy == "reject":
+                    self.logger.warning(
+                        "Dropping relationship %r->%r (%s): endpoint is synthetic and "
+                        "unknown_relation_endpoint='reject'",
+                        subj,
+                        obj,
+                        item.predicate,
+                    )
+                    self._rejected_relationships += 1
+                    return
+                # The promoted set is rebuilt only for relationships that actually
+                # carry a synthetic endpoint. Ordinary relationships (the common
+                # case) must not pay an O(all_entities) scan per item, which made
+                # build() quadratic on dense relation inputs.
+                existing_ids: Set[Any] = set()
+                for _ent in all_entities:
+                    if not isinstance(_ent, dict):
+                        continue
+                    for _key in ("id", "entity_id"):
+                        _cid = _ent.get(_key)
+                        if _cid is None:
+                            continue
+                        try:
+                            existing_ids.add(_cid)
+                        except TypeError:
+                            # Invalid/unhashable IDs are left for graph validation.
+                            continue
+                for endpoint in synthetic_endpoints:
+                    if isinstance(endpoint, str):
+                        endpoint_id = endpoint
+                        endpoint_text = endpoint
+                    else:
+                        endpoint_id = endpoint.id if hasattr(endpoint, "id") else endpoint.text
+                        endpoint_text = endpoint.text
+                    if endpoint_id in existing_ids:
+                        continue
+                    all_entities.append(
+                        {
+                            "id": endpoint_id,
+                            "name": endpoint_text,
+                            "type": "UNKNOWN",
+                            "confidence": 0.8,
+                            "metadata": {"synthetic": True},
+                        }
+                    )
+                    existing_ids.add(endpoint_id)
             subj_id = getattr(subj, "id", getattr(subj, "text", str(subj))) if not isinstance(subj, str) else subj
             obj_id = getattr(obj, "id", getattr(obj, "text", str(obj))) if not isinstance(obj, str) else obj
             rel_dict = {
@@ -226,26 +359,190 @@ class GraphBuilder:
                     found_something = True
         else:
             # Unknown type
-            pass
+            self.logger.warning(
+                "Skipping unsupported source type: %s", type(item).__name__
+            )
+
+    def _get_extractor(
+        self, kind: str, extractor_cls, method: Union[str, List[str]]
+    ):
+        """Return a cached extractor for this method, building it on first use.
+
+        Extractors hold no per-text state but are expensive to construct —
+        ``NERExtractor(method="ml")`` loads a spaCy model in ``__init__``.
+        Keying on kind and method is enough because ``self.config`` is fixed
+        for the lifetime of the builder.
+
+        Args:
+            kind: Extractor role, one of ``"ner"``, ``"relation"``, ``"triplet"``.
+            extractor_cls: Extractor class to construct on a cache miss.
+            method: A method name, or a list of them for fallback ordering.
+                Lists are converted to tuples for the cache key only; the
+                extractor still receives the original value.
+        """
+        key = (kind, tuple(method) if isinstance(method, list) else method)
+        if key not in self._extractor_cache:
+            self._extractor_cache[key] = extractor_cls(method=method, **self.config)
+        return self._extractor_cache[key]
+
+    def _remap_relationship_endpoints(
+        self,
+        entities: List[Dict[str, Any]],
+        relationships: List[Dict[str, Any]],
+    ) -> int:
+        """Rewrite relationship endpoints after entity resolution.
+
+        Entity merging keeps the canonical entity ID and records the IDs of all
+        merged inputs in ``merged_from``.  Relationships are collected before
+        resolution, so without this remapping they can continue to reference an
+        entity that is no longer present in the graph.
+
+        Returns:
+            The number of relationship endpoints that were remapped.
+        """
+        endpoint_map: Dict[Any, Any] = {}
+
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+
+            canonical_id = entity.get("id")
+            if canonical_id is None:
+                canonical_id = entity.get("entity_id")
+            if canonical_id is None:
+                continue
+
+            # Keep canonical IDs stable and map every source ID retained by the
+            # merge operation to the surviving entity.
+            try:
+                endpoint_map[canonical_id] = canonical_id
+            except TypeError:
+                # Invalid/unhashable IDs are left for graph validation to report
+                # rather than making graph construction fail here.
+                continue
+
+            merged_from = entity.get("merged_from") or []
+            if isinstance(merged_from, (list, tuple, set)):
+                for source_id in merged_from:
+                    if source_id is not None:
+                        try:
+                            endpoint_map[source_id] = canonical_id
+                        except TypeError:
+                            # Skip invalid aliases while preserving valid ones.
+                            continue
+
+        remapped_count = 0
+        for relationship in relationships:
+            if not isinstance(relationship, dict):
+                continue
+
+            for endpoint, endpoint_alias in (
+                ("source", "source_id"),
+                ("target", "target_id"),
+            ):
+                endpoint_id = relationship.get(endpoint)
+                try:
+                    canonical_id = endpoint_map.get(endpoint_id)
+                except TypeError:
+                    # Invalid/unhashable endpoints are left for graph validation
+                    # to report rather than making graph construction fail here.
+                    continue
+
+                if canonical_id is None:
+                    continue
+
+                remapped = canonical_id != endpoint_id
+                if remapped:
+                    relationship[endpoint] = canonical_id
+
+                if (
+                    endpoint_alias in relationship
+                    and relationship[endpoint_alias] != canonical_id
+                ):
+                    relationship[endpoint_alias] = canonical_id
+                    remapped = True
+
+                if remapped:
+                    remapped_count += 1
+
+        if remapped_count:
+            self.logger.info(
+                "Remapped %d relationship endpoint(s) after entity resolution",
+                remapped_count,
+            )
+        return remapped_count
+
+    def _screen_text(self, text: str, options: Dict[str, Any]) -> None:
+        """Screen once before extraction, consuming boundary-only options."""
+        config = {
+            key: options.pop(key, default)
+            for key, default in self._screening_options.items()
+        }
+        if not isinstance(config["screening"], bool):
+            raise ValueError("screening must be a bool")
+        if not config["screening"]:
+            return
+        mode = config["screening_mode"]
+        if mode not in ("log", "annotate"):
+            raise ValueError("screening_mode must be 'log' or 'annotate'")
+
+        from ..ingest.screening import get_scanner, validate_findings
+
+        scanner = get_scanner(config["screening_method"])
+        text_index = self._screened_text_count
+        self._screened_text_count += 1
+        report = {
+            "text_index": text_index,
+            "method": config["screening_method"],
+            "status": "ok",
+            "findings": [],
+        }
+        try:
+            findings = validate_findings(scanner(text), text)
+            if findings:
+                # Do not put source text, excerpts, or backend-controlled IDs
+                # into logs: ingested documents may contain sensitive data.
+                self.logger.warning(
+                    "Content screening flagged text %d (%d finding(s)); "
+                    "extraction continues unchanged",
+                    text_index,
+                    len(findings),
+                )
+            report["findings"] = [finding.to_dict() for finding in findings]
+        except Exception:
+            # This first slice is advisory. Keep failures distinguishable from
+            # successful scans with no matches, without logging payloads that
+            # a backend may include in its exception message.
+            report["status"] = "error"
+            self.logger.warning(
+                "Content screening failed for text %d; extraction continues unchanged",
+                text_index,
+            )
+        if mode == "annotate":
+            self._screening_reports.append(report)
 
     def _extract_from_text(self, text: str, all_entities: List[Any], all_relationships: List[Any], **options):
         """Helper to extract knowledge from text using configured methods."""
         if not options.get("extract", True):
             return
 
+        self._screen_text(text, options)
+
         from ..semantic_extract.ner_extractor import NERExtractor
         from ..semantic_extract.relation_extractor import RelationExtractor
         from ..semantic_extract.triplet_extractor import TripletExtractor
         
-        # Default to LLM methods as per requirement
-        ner_method = options.get("ner_method", "llm")
-        relation_method = options.get("relation_method", "llm")
-        triplet_method = options.get("triplet_method", "llm")
+        # Local extractors by default — raw-text build() must not require a
+        # provider, API key, or network access. Pass ner_method="llm" (and the
+        # relation/triplet equivalents) to opt into LLM extraction.
+        ner_method = options.get("ner_method", "ml")
+        relation_method = options.get("relation_method", "pattern")
+        triplet_method = options.get("triplet_method", "pattern")
         
         self.logger.info(f"Extracting knowledge from text ({len(text)} chars) using {ner_method}...")
         
         # 1. Extract Entities
-        ner = NERExtractor(method=ner_method, **self.config)
+        ner = self._get_extractor("ner", NERExtractor, ner_method)
         try:
             entities = ner.extract_entities(text, **options)
             extracted_count = len(entities)
@@ -258,8 +555,16 @@ class GraphBuilder:
             entities = []
         
         # 2. Extract Relations (if requested)
-        if options.get("extract_relations", True):
-            rel_extractor = RelationExtractor(method=relation_method, **self.config)
+        # Stays None when relation extraction is skipped or fails, which lets
+        # TripletExtractor derive its own relations as before. When we do have
+        # them, they are forwarded below so triplets reuse the relations
+        # extracted with relation_method rather than re-deriving via
+        # triplet_method.
+        relations = None
+        if options.get("extract_relations", False):
+            rel_extractor = self._get_extractor(
+                "relation", RelationExtractor, relation_method
+            )
             try:
                 # Pass entities if available to help relation extraction
                 relations = rel_extractor.extract_relations(text, entities=entities, **options)
@@ -273,9 +578,13 @@ class GraphBuilder:
 
         # 3. Extract Triplets (if requested)
         if options.get("extract_triplets", True):
-            trip_extractor = TripletExtractor(method=triplet_method, **self.config)
+            trip_extractor = self._get_extractor(
+                "triplet", TripletExtractor, triplet_method
+            )
             try:
-                triplets = trip_extractor.extract_triplets(text, entities=entities, **options)
+                triplets = trip_extractor.extract_triplets(
+                    text, entities=entities, relations=relations, **options
+                )
                 extracted_count = len(triplets)
                 self._extraction_stats["extracted_triplets"] += extracted_count
                 self.logger.info(f"Extracted {extracted_count} triplets")
@@ -291,21 +600,58 @@ class GraphBuilder:
         pipeline_id: Optional[str] = None,
         **options,
     ) -> Dict[str, Any]:
-        """
-        Build knowledge graph from sources.
+        """Build a knowledge graph from one or more sources.
 
         Args:
-            sources: Entities or sources list
-            second_arg: Optional relationships list or entity_resolver (for backward compatibility)
-            pipeline_id: Optional pipeline ID for progress tracking
-            **options: Additional build options
-                - extract: Whether to extract entities from text (default: True)
-                - extract_relations: Whether to extract relations from text (default: False)
-                - ner_method: NER method to use (default: "ml")
-                - triplet_method: Triplet extraction method (default: "pattern")
+            sources: A source or list of sources. Sources may be text,
+                pre-extracted objects, or dictionaries containing ``entities``
+                and ``relationships``.
+            second_arg: An optional relationship list or entity resolver kept
+                for backward compatibility.
+            pipeline_id: Optional pipeline identifier used for progress
+                tracking.
+            **options: Additional graph-building options:
+
+                - ``extract`` (bool): Whether to run text extraction when a
+                  raw string or ``{"text": ...}`` dict is passed as a source
+                  (default: ``True``).
+                - ``extract_relations`` (bool): Whether to extract relations
+                  during text extraction (default: ``False``).
+                - ``extract_triplets`` (bool): Whether to extract triplets
+                  during text extraction (default: ``True``).
+                - ``ner_method`` (str): NER backend used for text extraction
+                  (e.g. ``"ml"``, ``"pattern"``, ``"llm"``; default: ``"ml"``).
+                - ``relation_method`` (str): Relation-extraction backend
+                  (e.g. ``"pattern"``, ``"llm"``; default: ``"pattern"``).
+                - ``triplet_method`` (str): Triplet-extraction backend
+                  (e.g. ``"pattern"``, ``"llm"``; default: ``"pattern"``).
+                - ``entity_resolver``: An :class:`EntityResolver` instance
+                  that overrides the one configured on the builder.
+                - ``relationships`` (list): An explicit list of relationships
+                  to include in addition to those found in *sources*.
+                - ``screening`` (bool): Screen raw text before extraction
+                  (default: ``False``). May also be set on the builder.
+                - ``screening_method`` (str): Registered ``screen`` method,
+                  or ``"baseline"`` (default).
+                - ``screening_mode`` (str): ``"annotate"`` (default) adds
+                  reports to ``metadata.content_screening``; ``"log"`` only
+                  logs finding counts and failures. Neither mode blocks text.
+
+            Raw-text extraction uses local extractors by default and needs no
+            provider or API key. To use LLM extraction, pass the methods
+            explicitly, e.g. ``ner_method="llm"``.
 
         Returns:
-            Dictionary containing entities and relationships
+            A dictionary containing the graph's ``entities``,
+            ``relationships``, and build ``metadata``.
+
+        Example:
+            >>> builder = GraphBuilder(resolve_conflicts=False)
+            >>> graph = builder.build(  # doctest: +SKIP
+            ...     {"entities": [{"id": "ada"}], "relationships": []}
+            ... )
+            >>> graph["metadata"]["num_entities"]  # doctest: +SKIP
+            1
         """
         # Handle arguments
         entity_resolver = None
@@ -378,6 +724,10 @@ class GraphBuilder:
             "extracted_relations": 0,
             "extracted_triplets": 0
         }
+        # Reset per-run rejection counter.
+        self._rejected_relationships = 0
+        self._screening_reports = []
+        self._screened_text_count = 0
         
         tracking_id = self.progress_tracker.start_tracking(
             module="kg",
@@ -607,6 +957,49 @@ class GraphBuilder:
                     f"Entity resolution complete: {len(all_entities)} -> {len(resolved_entities)} unique entities"
                 )
 
+            # Relationships were collected before entity resolution. Rewrite
+            # endpoints only when resolution produced merged entity IDs.
+            if resolver_to_use:
+                has_merged_entities = any(
+                    isinstance(entity, dict) and entity.get("merged_from")
+                    for entity in resolved_entities
+                )
+                if has_merged_entities:
+                    self._remap_relationship_endpoints(resolved_entities, all_relationships)
+
+            # When a synthetic endpoint is promoted before the real entity arrives
+            # (e.g. relation data precedes NER entity data for the same text),
+            # the same id can appear once as synthetic and once as real. Prefer
+            # the real entity so the graph does not carry a duplicated,
+            # lower-confidence duplicate.
+            _real_ids: Set[Any] = set()
+            for _entity in resolved_entities:
+                if (
+                    isinstance(_entity, dict)
+                    and not (_entity.get("metadata") or {}).get("synthetic")
+                ):
+                    for _cid in (_entity.get("id"), _entity.get("entity_id")):
+                        if _cid is None:
+                            continue
+                        try:
+                            _real_ids.add(_cid)
+                        except TypeError:
+                            # Invalid/unhashable IDs are left for graph validation
+                            # to report rather than failing graph construction here.
+                            continue
+            if _real_ids:
+                filtered = []
+                for _entity in resolved_entities:
+                    if (
+                        isinstance(_entity, dict)
+                        and (_entity.get("metadata") or {}).get("synthetic")
+                    ):
+                        _eid = _entity.get("id")
+                        if _eid in _real_ids:
+                            continue
+                    filtered.append(_entity)
+                resolved_entities = filtered
+
             if input_relationships_count > 0 and len(all_relationships) == 0:
                 warning_msg = (
                     f"All relationships were dropped during graph building: "
@@ -626,9 +1019,12 @@ class GraphBuilder:
                     "temporal_enabled": self.enable_temporal,
                     "timestamp": self._get_timestamp(),
                     "entity_resolution_applied": resolver_to_use is not None,
+                    "rejected_relationships": self._rejected_relationships,
                 },
             }
             structure_time = time.time() - structure_start
+            if self._screening_reports:
+                graph["metadata"]["content_screening"] = self._screening_reports
             self.logger.debug("Graph structure built in %.2fs", structure_time)
 
             # Persist to GraphStore if available
@@ -730,6 +1126,26 @@ class GraphBuilder:
         pipeline_id: Optional[str] = None,
         **options,
     ) -> Dict[str, Any]:
+        """Build a knowledge graph from a single source dictionary.
+
+        Args:
+            kg_data: Source data containing entities, relationships, or both.
+            pipeline_id: Optional pipeline identifier used for progress
+                tracking.
+            **options: Additional options forwarded to :meth:`build`.
+
+        Returns:
+            A dictionary containing the graph's ``entities``,
+            ``relationships``, and build ``metadata``.
+
+        Example:
+            >>> builder = GraphBuilder(resolve_conflicts=False)
+            >>> graph = builder.build_single_source(  # doctest: +SKIP
+            ...     {"entities": [{"id": "ada"}], "relationships": []}
+            ... )
+            >>> len(graph["entities"])  # doctest: +SKIP
+            1
+        """
         return self.build(kg_data, pipeline_id=pipeline_id, **options)
 
     def add_temporal_edge(
@@ -743,21 +1159,33 @@ class GraphBuilder:
         temporal_metadata=None,
         **kwargs,
     ):
-        """
-        Add edge with temporal validity information.
+        """Add an edge with temporal validity information to a graph.
 
         Args:
-            graph: Knowledge graph to add edge to
-            source: Source entity/node
-            target: Target entity/node
-            relationship: Relationship type
-            valid_from: Start time for relationship validity (datetime, timestamp, or ISO string)
-            valid_until: End time for relationship validity (None for ongoing)
-            temporal_metadata: Additional temporal metadata (timezone, precision, etc.)
-            **kwargs: Additional edge properties
+            graph: Mutable knowledge-graph dictionary to update.
+            source: Identifier of the source entity or node.
+            target: Identifier of the target entity or node.
+            relationship: Relationship type for the edge.
+            valid_from: Start of the validity period. Accepts a datetime or
+                ISO-formatted string; defaults to the current time.
+            valid_until: End of the validity period, or ``None`` for an
+                ongoing relationship.
+            temporal_metadata: Optional metadata such as timezone or
+                precision information.
+            **kwargs: Additional properties to include on the edge.
 
         Returns:
-            Edge object with temporal annotations
+            The temporal edge dictionary appended to the graph's
+            ``relationships`` list.
+
+        Example:
+            >>> builder = GraphBuilder(resolve_conflicts=False)
+            >>> graph = {"entities": [], "relationships": []}
+            >>> edge = builder.add_temporal_edge(  # doctest: +SKIP
+            ...     graph, "ada", "analytical-engine", "DESIGNED"
+            ... )
+            >>> edge["type"]  # doctest: +SKIP
+            'DESIGNED'
         """
         tracking_id = self.progress_tracker.start_tracking(
             module="kg",
@@ -806,17 +1234,29 @@ class GraphBuilder:
     def create_temporal_snapshot(
         self, graph, timestamp=None, snapshot_name=None, **options
     ):
-        """
-        Create temporal snapshot of graph at specific time point.
+        """Create a snapshot of a graph at a specific point in time.
 
         Args:
-            graph: Knowledge graph to snapshot
-            timestamp: Time point for snapshot (None for current time)
-            snapshot_name: Optional name for snapshot
-            **options: Additional snapshot options
+            graph: Knowledge graph whose entities and relationships will be
+                copied into the snapshot.
+            timestamp: Snapshot time, or ``None`` to use the current time.
+            snapshot_name: Optional human-readable snapshot name.
+            **options: Additional snapshot options reserved for extensions.
 
         Returns:
-            Temporal snapshot object
+            A snapshot dictionary containing the name, timestamp, all copied
+            entities, relationships valid at the timestamp, and summary
+            metadata.
+
+        Example:
+            >>> builder = GraphBuilder(resolve_conflicts=False)
+            >>> snapshot = builder.create_temporal_snapshot(  # doctest: +SKIP
+            ...     {"entities": [{"id": "ada"}], "relationships": []},
+            ...     timestamp="2026-01-01T00:00:00",
+            ...     snapshot_name="new-year",
+            ... )
+            >>> snapshot["name"]  # doctest: +SKIP
+            'new-year'
         """
         tracking_id = self.progress_tracker.start_tracking(
             module="kg",
@@ -897,19 +1337,32 @@ class GraphBuilder:
         temporal_window=None,
         **options,
     ):
-        """
-        Query graph at specific time point or time range.
+        """Query a graph at a specific time or over a time range.
 
         Args:
-            graph: Knowledge graph to query
-            query: Query (Cypher, SPARQL, or natural language)
-            at_time: Query at specific time point
-            time_range: Query within time range (start, end)
-            temporal_window: Temporal window size
-            **options: Additional query options
+            graph: Knowledge graph to query.
+            query: Query text to record in the result. The current
+                implementation does not interpret it or filter the graph.
+            at_time: Optional point in time at which to query the graph.
+            time_range: Optional ``(start, end)`` time range. The graph is
+                evaluated at the end of the range.
+            temporal_window: Optional temporal-window value reserved for
+                query-engine integrations.
+            **options: Additional query options reserved for extensions.
 
         Returns:
-            Query results with temporal context
+            A dictionary containing the query, temporal context, entities and
+            relationships from the selected graph or snapshot, and graph
+            metadata.
+
+        Example:
+            >>> builder = GraphBuilder(resolve_conflicts=False)
+            >>> result = builder.query_temporal(  # doctest: +SKIP
+            ...     {"entities": [{"id": "ada"}], "relationships": []},
+            ...     "MATCH (n) RETURN n",
+            ... )
+            >>> result["entities"][0]["id"]  # doctest: +SKIP
+            'ada'
         """
         tracking_id = self.progress_tracker.start_tracking(
             module="kg",
@@ -972,20 +1425,34 @@ class GraphBuilder:
         temporal_property="valid_time",
         **kwargs,
     ):
-        """
-        Load graph from Neo4j database.
+        """Load a knowledge graph from a Neo4j database.
 
         Args:
-            uri: Neo4j connection URI
-            username: Neo4j username
-            password: Neo4j password
-            database: Neo4j database name
-            enable_temporal: Enable temporal features for loaded graph
-            temporal_property: Property name for temporal data
-            **kwargs: Additional connection options
+            uri: Neo4j connection URI.
+            username: Neo4j username.
+            password:
+                Authentication credential supplied for the Neo4j user.
+            database: Neo4j database name.
+            enable_temporal: Whether to read temporal relationship data.
+            temporal_property: Relationship property containing temporal
+                data.
+            **kwargs: Additional connection options reserved for extensions.
 
         Returns:
-            Knowledge graph loaded from Neo4j
+            A dictionary containing loaded entities, relationships, and
+            source metadata.
+
+        Raises:
+            ImportError: If the Neo4j driver is unavailable.
+
+        Example:
+            >>> import os
+            >>> builder = GraphBuilder(resolve_conflicts=False)
+            >>> graph = builder.load_from_neo4j(  # doctest: +SKIP
+            ...     "bolt://localhost:7687",
+            ...     "neo4j",
+            ...     os.environ["NEO4J_PASSWORD"],
+            ... )
         """
         tracking_id = self.progress_tracker.start_tracking(
             module="kg",

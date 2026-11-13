@@ -24,9 +24,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from ..utils.exceptions import ProcessingError, ValidationError
-from ..utils.helpers import ensure_directory
+from ..utils.helpers import _require_mapping, ensure_directory, normalize_graph_payload
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+from .endpoint_names import SOURCE_ENDPOINT_NAMES, TARGET_ENDPOINT_NAMES, is_unset_id
 
 
 class LPGExporter:
@@ -154,15 +155,26 @@ class LPGExporter:
         """
         queries = []
 
-        # Generate indexes if requested
-        if self.include_indexes:
-            queries.extend(self._generate_indexes(knowledge_graph))
+        # A non-mapping payload cannot reach normalize_graph_payload(): it
+        # raises ValidationError for that case, which would leave this
+        # exporter alone in raising a different exception type than the YAML
+        # and Neo4j exporters raise for the identical mistake.
+        _require_mapping(
+            knowledge_graph, ("entities", "relationships", "nodes", "edges")
+        )
 
-        # Extract entities and relationships
-        entities = knowledge_graph.get("entities", [])
-        relationships = knowledge_graph.get("relationships", [])
-        nodes = knowledge_graph.get("nodes", entities)
-        edges = knowledge_graph.get("edges", relationships)
+        # Accept either vocabulary. Reading 'nodes' with 'entities' as the
+        # default dropped every entity when 'nodes' was present but empty --
+        # the shape JSONExporter emits -- so resolution is centralized.
+        normalized = normalize_graph_payload(knowledge_graph)
+        nodes = normalized["entities"]
+        edges = normalized["relationships"]
+
+        # Generate indexes if requested. Fed the normalized entities so index
+        # generation sees the same records as node generation; reading
+        # 'entities' directly here skipped indexes for nodes/edges payloads.
+        if self.include_indexes:
+            queries.extend(self._generate_indexes(nodes))
 
         # Generate node creation queries
         node_queries = self._generate_node_queries(nodes)
@@ -174,13 +186,18 @@ class LPGExporter:
 
         return queries
 
-    def _generate_indexes(self, knowledge_graph: Dict[str, Any]) -> List[str]:
-        """Generate Cypher index and constraint creation queries."""
+    def _generate_indexes(self, entities: List[Dict[str, Any]]) -> List[str]:
+        """Generate Cypher index and constraint creation queries.
+
+        Args:
+            entities: Entity records, already resolved from whichever
+                vocabulary the caller supplied.
+        """
         indexes = []
 
         # Get unique entity types for labels
         entity_types = set()
-        for entity in knowledge_graph.get("entities", []):
+        for entity in entities:
             entity_type = entity.get("type") or entity.get("entity_type")
             if entity_type:
                 entity_types.add(entity_type)
@@ -217,16 +234,22 @@ class LPGExporter:
 
         lines = []
         for idx, node in enumerate(nodes):
-            node_id = node.get("id") or node.get("entity_id", f"node_{idx}")
+            node_id = next(
+                (
+                    node[key]
+                    for key in ("id", "entity_id")
+                    if not is_unset_id(node.get(key))
+                ),
+                f"node_{idx}",
+            )
             node_type = node.get("type") or node.get("entity_type", "Entity")
             label = node.get("label") or node.get("name") or node.get("text", "")
 
-            # Escape special characters
-            node_id_escaped = self._escape_cypher_string(str(node_id))
-            label_escaped = self._escape_cypher_string(str(label))
-
             # Build properties
-            properties = {"id": node_id_escaped, "name": label_escaped}
+            properties = {
+                "id": self._format_cypher_value(node_id),
+                "name": self._format_cypher_value(str(label)),
+            }
 
             # Add other properties
             for key, value in node.items():
@@ -269,26 +292,38 @@ class LPGExporter:
 
         lines = []
         for idx, edge in enumerate(edges):
-            source_id = edge.get("source") or edge.get("source_id")
-            target_id = edge.get("target") or edge.get("target_id")
+            source_id = next(
+                (
+                    edge[key]
+                    for key in SOURCE_ENDPOINT_NAMES
+                    if not is_unset_id(edge.get(key))
+                ),
+                None,
+            )
+            target_id = next(
+                (
+                    edge[key]
+                    for key in TARGET_ENDPOINT_NAMES
+                    if not is_unset_id(edge.get(key))
+                ),
+                None,
+            )
             rel_type = edge.get("type") or edge.get("relationship_type", "RELATED_TO")
 
-            if not source_id or not target_id:
+            if source_id is None or target_id is None:
                 continue
 
             # Escape special characters
-            source_escaped = self._escape_cypher_string(str(source_id))
-            target_escaped = self._escape_cypher_string(str(target_id))
+            source_escaped = self._format_cypher_value(source_id)
+            target_escaped = self._format_cypher_value(target_id)
             rel_type_escaped = rel_type.upper().replace(" ", "_")
 
             # Build properties
             properties = {}
             for key, value in edge.items():
                 if key not in [
-                    "source",
-                    "source_id",
-                    "target",
-                    "target_id",
+                    *SOURCE_ENDPOINT_NAMES,
+                    *TARGET_ENDPOINT_NAMES,
                     "type",
                     "relationship_type",
                 ]:
@@ -304,7 +339,7 @@ class LPGExporter:
 
             # Create relationship
             lines.append(
-                f"MATCH (a {{id: '{source_escaped}'}}), (b {{id: '{target_escaped}'}}) "
+                f"MATCH (a {{id: {source_escaped}}}), (b {{id: {target_escaped}}}) "
                 f"CREATE (a)-[r:{rel_type_escaped}{props_str}]->(b);"
             )
 
@@ -312,7 +347,7 @@ class LPGExporter:
 
     def _escape_cypher_string(self, value: str) -> str:
         """Escape special characters in Cypher strings."""
-        return value.replace("'", "\\'").replace("\\", "\\\\")
+        return value.replace("\\", "\\\\").replace("'", "\\'")
 
     def _format_cypher_value(self, value: Any) -> str:
         """Format a value for Cypher query."""

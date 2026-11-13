@@ -365,6 +365,24 @@ def get_decision_statistics(
     outcome_counts = {}
     confidence_values = []
     
+    # For persistent backends (faiss, qdrant, etc.) the facade now maintains a
+    # mirror in store.metadata, but that mirror only reflects vectors written
+    # through the facade in the current session. Iterating it would silently
+    # miss data stored externally or in a previous session. Return zeroed stats
+    # with an explicit warning instead, as this function did before the mirror
+    # was introduced.
+    if getattr(store, "backend", "inmemory") != "inmemory":
+        return {
+            "total_decisions": 0,
+            "categories": {},
+            "outcomes": {},
+            "average_confidence": 0.0,
+            "min_confidence": 0.0,
+            "max_confidence": 0.0,
+            "has_structural_embeddings": False,
+            "warning": "Statistics not supported for persistent backends without full metadata access."
+        }
+    
     for metadata in store.metadata.values():
         # Count by category
         category = metadata.get("category", "unknown")

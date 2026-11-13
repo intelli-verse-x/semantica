@@ -286,9 +286,9 @@ class TestSQLiteVecStoreUpdate:
         new_vectors = [np.random.rand(128).astype(np.float32) for _ in range(2)]
         new_metadata = [{"version": 2} for _ in range(2)]
 
-        success = store.update(ids, new_vectors, new_metadata)
+        updated = store.update(ids, new_vectors, new_metadata)
 
-        assert success is True
+        assert updated == ids
 
         results = store.get(ids)
         assert len(results) == 2
@@ -303,9 +303,9 @@ class TestSQLiteVecStoreUpdate:
         vectors = [np.random.rand(128).astype(np.float32)]
         ids = store.add(vectors, [{"tag": "original"}])
 
-        success = store.update(ids, metadata=[{"tag": "updated"}])
+        updated = store.update(ids, metadata=[{"tag": "updated"}])
 
-        assert success is True
+        assert updated == ids
 
         results = store.get(ids)
         assert results[0]["metadata"]["tag"] == "updated"
@@ -316,13 +316,60 @@ class TestSQLiteVecStoreUpdate:
         ids = store.add(vectors, [{"tag": "keep"}])
 
         new_vector = np.random.rand(128).astype(np.float32)
-        success = store.update(ids, vectors=[new_vector])
+        updated = store.update(ids, vectors=[new_vector])
 
-        assert success is True
+        assert updated == ids
 
         results = store.get(ids)
         assert np.allclose(results[0]["vector"], new_vector)
         assert results[0]["metadata"]["tag"] == "keep"
+
+    def test_update_empty_ids(self, store):
+        """An empty request matches nothing and does not write."""
+        assert store.update([]) == []
+
+    def test_update_missing_id_matches_nothing(self, store):
+        """A missing id is omitted and is not inserted."""
+        new_vector = np.random.rand(128).astype(np.float32)
+
+        assert store.update(["missing"], [new_vector], [{"tag": "x"}]) == []
+        assert store.get(["missing"]) == []
+
+    def test_update_mixed_existing_and_missing_ids(self, store):
+        """Only ids that match a row are returned and changed."""
+        vectors = [np.random.rand(128).astype(np.float32) for _ in range(2)]
+        ids = store.add(vectors, [{"tag": "a"}, {"tag": "b"}])
+        new_vectors = [np.random.rand(128).astype(np.float32) for _ in range(3)]
+        new_metadata = [{"tag": "a2"}, {"tag": "missing"}, {"tag": "b2"}]
+        requested = [ids[0], "missing-id", ids[1]]
+
+        updated = store.update(requested, new_vectors, new_metadata)
+
+        assert updated == [ids[0], ids[1]]
+        results = {row["id"]: row for row in store.get(ids + ["missing-id"])}
+        assert "missing-id" not in results
+        assert results[ids[0]]["metadata"]["tag"] == "a2"
+        assert np.allclose(results[ids[0]]["vector"], new_vectors[0])
+        assert results[ids[1]]["metadata"]["tag"] == "b2"
+        assert np.allclose(results[ids[1]]["vector"], new_vectors[2])
+
+    def test_update_duplicate_id_is_confirmed_once(self, store):
+        """A repeated id is written in order and reported once."""
+        vector = np.random.rand(128).astype(np.float32)
+        ids = store.add([vector], [{"tag": "a"}])
+        first = np.random.rand(128).astype(np.float32)
+        second = np.random.rand(128).astype(np.float32)
+
+        updated = store.update(
+            [ids[0], ids[0]],
+            [first, second],
+            [{"tag": "1"}, {"tag": "2"}],
+        )
+
+        assert updated == [ids[0]]
+        result = store.get(ids)[0]
+        assert result["metadata"]["tag"] == "2"
+        assert np.allclose(result["vector"], second)
 
 
 class TestSQLiteVecStoreDelete:
@@ -413,3 +460,93 @@ class TestSQLiteVecStoreStats:
 
         stats = store.get_stats()
         assert stats["vector_count"] == 4
+
+
+class TestSQLiteVecStoreScan:
+    """Test scan_vectors pagination."""
+
+    def test_scan_returns_all_vectors_across_pages(self, store):
+        vectors = [np.random.rand(128).astype(np.float32) for _ in range(5)]
+        ids = store.add(vectors, [{"index": i} for i in range(5)])
+
+        seen_ids = []
+        offset = 0
+        while True:
+            page = store.scan_vectors(offset=offset, limit=2)
+            if not page:
+                break
+            seen_ids.extend(p["id"] for p in page)
+            offset += len(page)
+
+        assert set(seen_ids) == set(ids)
+        assert len(seen_ids) == 5
+
+    def test_scan_page_includes_vector_and_metadata(self, store):
+        vectors = [np.random.rand(128).astype(np.float32)]
+        ids = store.add(vectors, [{"tag": "only"}])
+
+        page = store.scan_vectors(offset=0, limit=10)
+
+        assert len(page) == 1
+        assert page[0]["id"] == ids[0]
+        assert page[0]["metadata"] == {"tag": "only"}
+        assert page[0]["vector"] is not None
+
+    def test_scan_empty_store_returns_empty_list(self, store):
+        assert store.scan_vectors(offset=0, limit=10) == []
+
+    def test_scan_zero_limit_returns_empty_list(self, store):
+        store.add([np.random.rand(128).astype(np.float32)])
+        assert store.scan_vectors(offset=0, limit=0) == []
+
+    def test_scan_offset_past_end_returns_empty_list(self, store):
+        store.add([np.random.rand(128).astype(np.float32)])
+        assert store.scan_vectors(offset=100, limit=10) == []
+
+
+class TestSQLiteVecStoreFilterByMetadata:
+    """Test filter_by_metadata, including list-valued metadata handling."""
+
+    def test_filter_exact_match(self, store):
+        vectors = [np.random.rand(128).astype(np.float32) for _ in range(2)]
+        metadata = [{"category": "finance"}, {"category": "tech"}]
+        ids = store.add(vectors, metadata, ids=["v1", "v2"])
+
+        results = store.filter_by_metadata({"category": "finance"}, limit=10)
+
+        assert [r["id"] for r in results] == ["v1"]
+
+    def test_filter_scalar_field_against_list_filter(self, store):
+        """A scalar metadata value should match via plain IN-list membership."""
+        vectors = [np.random.rand(128).astype(np.float32) for _ in range(2)]
+        metadata = [{"category": "finance"}, {"category": "tech"}]
+        store.add(vectors, metadata, ids=["v1", "v2"])
+
+        results = store.filter_by_metadata({"category": ["finance", "ops"]}, limit=10)
+
+        assert [r["id"] for r in results] == ["v1"]
+
+    def test_filter_array_field_intersects_list_filter(self, store):
+        """A list-valued metadata field must match on set intersection with the
+        filter list, mirroring the in-memory backend's semantics -- not on a
+        literal comparison of the whole array's JSON text against each candidate.
+        """
+        vectors = [np.random.rand(128).astype(np.float32) for _ in range(3)]
+        metadata = [
+            {"tags": ["python", "js"]},
+            {"tags": ["go"]},
+            {"tags": ["python", "ml"]},
+        ]
+        store.add(vectors, metadata, ids=["v1", "v2", "v3"])
+
+        results = store.filter_by_metadata({"tags": ["python", "ml"]}, limit=10)
+
+        assert {r["id"] for r in results} == {"v1", "v3"}
+
+    def test_filter_limit_zero_returns_empty(self, store):
+        vectors = [np.random.rand(128).astype(np.float32)]
+        store.add(vectors, [{"category": "finance"}], ids=["v1"])
+
+        results = store.filter_by_metadata({"category": "finance"}, limit=0)
+
+        assert results == []

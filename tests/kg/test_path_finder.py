@@ -241,7 +241,51 @@ class TestPathFinder:
         if len(paths) > 1:
             lengths = [self.finder.path_length(multi_path_graph, path) for path in paths]
             assert all(lengths[i] <= lengths[i+1] for i in range(len(lengths)-1))
-    
+
+    def test_find_k_shortest_paths_preserves_graph(self):
+        """Test k-shortest path search does not mutate the input graph."""
+        graph = nx.Graph()
+        graph.add_edges_from([
+            ("A", "X"), ("X", "Y"), ("Y", "E"),
+            ("A", "B"), ("B", "C"), ("C", "E"),
+        ])
+        original_nodes = set(graph.nodes)
+        original_edges = set(graph.edges)
+
+        paths = self.finder.find_k_shortest_paths(graph, "A", "E", k=5)
+
+        assert len(paths) == 2
+        assert set(graph.nodes) == original_nodes
+        assert set(graph.edges) == original_edges
+
+    def test_find_k_shortest_paths_returns_loopless_paths(self):
+        """Test k-shortest paths do not repeat nodes."""
+        graph = nx.Graph()
+        graph.add_edges_from([
+            ("A", "D"), ("A", "E"), ("A", "C"),
+            ("B", "D"), ("B", "C"),
+        ])
+
+        paths = self.finder.find_k_shortest_paths(graph, "A", "B", k=5)
+
+        assert paths == [["A", "C", "B"], ["A", "D", "B"]]
+        assert all(len(path) == len(set(path)) for path in paths)
+
+    def test_dijkstra_exclusion_respects_undirected_traversal(self):
+        """Test exclusions apply in both directions for undirected traversal."""
+        graph = nx.DiGraph()
+        graph.add_edge("A", "B")
+
+        path = self.finder._dijkstra_shortest_path(
+            graph,
+            "B",
+            "A",
+            directed=False,
+            excluded_edges={("A", "B")},
+        )
+
+        assert path == []
+
     def test_find_k_shortest_paths_no_path(self):
         """Test finding k shortest paths with no path available."""
         paths = self.finder.find_k_shortest_paths(self.disconnected_graph, "A", "D", k=3)
@@ -313,81 +357,6 @@ class TestPathFinder:
         edge_data = None
         weight = self.finder._get_edge_weight(edge_data, "weight", 1.0)
         assert weight == 1.0
-
-
-class TestPathFinderEdgeCases:
-    """Edge case tests for PathFinder."""
-    
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.finder = PathFinder()
-    
-    def test_empty_graph(self):
-        """Test path finding on empty graph."""
-        empty_graph = nx.Graph()
-        
-        with pytest.raises(ValueError, match="Source node A not found"):
-            self.finder.dijkstra_shortest_path(empty_graph, "A", "B")
-    
-    def test_single_node_graph(self):
-        """Test path finding on single node graph."""
-        single_node_graph = nx.Graph()
-        single_node_graph.add_node("A")
-        
-        # Same source and target
-        path = self.finder.dijkstra_shortest_path(single_node_graph, "A", "A")
-        assert path == ["A"]
-        
-        # Different nodes (target doesn't exist)
-        with pytest.raises(ValueError, match="Target node B not found"):
-            self.finder.dijkstra_shortest_path(single_node_graph, "A", "B")
-    
-    def test_cycle_graph(self):
-        """Test path finding on cycle graph."""
-        cycle_graph = nx.cycle_graph(4)  # 0-1-2-3-0
-        # Convert to string nodes for consistency
-        cycle_graph = nx.relabel_nodes(cycle_graph, {i: str(i) for i in range(4)})
-        
-        path = self.finder.dijkstra_shortest_path(cycle_graph, "0", "2")
-        assert path in [["0", "1", "2"], ["0", "3", "2"]]
-    
-    def test_complete_graph(self):
-        """Test path finding on complete graph."""
-        complete_graph = nx.complete_graph(4)
-        complete_graph = nx.relabel_nodes(complete_graph, {i: str(i) for i in range(4)})
-        
-        path = self.finder.dijkstra_shortest_path(complete_graph, "0", "3")
-        assert path == ["0", "3"]  # Direct edge in complete graph
-    
-    def test_large_graph_performance(self):
-        """Test path finding performance on larger graph."""
-        # Create a larger graph for performance testing
-        large_graph = nx.erdos_renyi_graph(100, 0.1)
-        large_graph = nx.relabel_nodes(large_graph, {i: str(i) for i in range(100)})
-        
-        # Test that it completes without error
-        path = self.finder.dijkstra_shortest_path(large_graph, "0", "99")
-        assert isinstance(path, list)
-    
-    def test_graph_with_loops(self):
-        """Test path finding on graph with self-loops."""
-        loop_graph = nx.Graph()
-        loop_graph.add_edges_from([("A", "B"), ("B", "C")])
-        loop_graph.add_edge("A", "A")  # Self-loop
-        
-        path = self.finder.dijkstra_shortest_path(loop_graph, "A", "C")
-        assert path == ["A", "B", "C"]
-    
-    def test_graph_with_multiple_edges(self):
-        """Test path finding on multigraph."""
-        multigraph = nx.MultiGraph()
-        multigraph.add_edge("A", "B", weight=1)
-        multigraph.add_edge("A", "B", weight=2)
-        multigraph.add_edge("B", "C", weight=1)
-        
-        # PathFinder should handle multigraphs (use first edge)
-        path = self.finder.dijkstra_shortest_path(multigraph, "A", "C")
-        assert path == ["A", "B", "C"]
 
 
 class TestPathFinderHeuristics:

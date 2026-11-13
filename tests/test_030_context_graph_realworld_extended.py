@@ -54,6 +54,11 @@ from semantica.context.decision_models import (
     validate_decision,
 )
 
+# ── Export module ──────────────────────────────────────────────────────────────
+# Set by the exporter's own `import pyarrow` attempt; False when pyarrow is
+# missing or unimportable.
+from semantica.export.parquet_exporter import PARQUET_AVAILABLE
+
 # ── KG module ──────────────────────────────────────────────────────────────────
 from semantica.kg import (
     CentralityCalculator,
@@ -476,17 +481,94 @@ class TestContextGraphAdvancedDecisionMethods:
         assert result["compliant"] is True
         assert len(result["violations"]) == 0
 
-    def test_enforce_decision_policy_long_reasoning_warning(self):
+    def test_enforce_decision_policy_reasoning_within_storage_limit_no_warning(self):
         g = ContextGraph()
         decision_data = {
             "outcome": "approved",
             "confidence": 0.85,
-            "reasoning": "X" * 1500,  # Exceeds default 1000 char limit
+            "reasoning": "X" * 1500,  # Within record_decision's 10000-char limit
+            "decision_maker": "bot",
+        }
+        result = g.enforce_decision_policy(decision_data)
+        # record_decision accepts reasoning up to 10000 characters, so the
+        # default policy must not warn on input that storage considers valid.
+        assert len(result["warnings"]) == 0
+        assert result["compliant"] is True
+
+    def test_enforce_decision_policy_reasoning_exactly_at_storage_limit_no_warning(self):
+        g = ContextGraph()
+        decision_data = {
+            "outcome": "approved",
+            "confidence": 0.85,
+            "reasoning": "X" * 10000,  # Exactly at record_decision's 10000-char limit
+            "decision_maker": "bot",
+        }
+        result = g.enforce_decision_policy(decision_data)
+        # The limit is inclusive: exactly 10000 characters must not warn.
+        assert len(result["warnings"]) == 0
+        assert result["compliant"] is True
+
+    def test_enforce_decision_policy_reasoning_above_storage_limit_warning(self):
+        g = ContextGraph()
+        decision_data = {
+            "outcome": "approved",
+            "confidence": 0.85,
+            "reasoning": "X" * 10001,  # Exceeds record_decision's 10000-char limit
             "decision_maker": "bot",
         }
         result = g.enforce_decision_policy(decision_data)
         # Should generate a warning (long reasoning) but may still be compliant
         assert len(result["warnings"]) > 0
+
+    def test_enforce_decision_policy_custom_max_reasoning_length(self):
+        g = ContextGraph()
+        decision_data = {
+            "outcome": "approved",
+            "confidence": 0.85,
+            "reasoning": "X" * 600,  # Exceeds the custom 500-char limit
+            "decision_maker": "bot",
+        }
+        custom_rules = {"max_reasoning_length": 500}
+        result = g.enforce_decision_policy(decision_data, policy_rules=custom_rules)
+        assert len(result["warnings"]) > 0
+
+    def test_enforce_decision_policy_reasoning_length_ignores_surrounding_whitespace(self):
+        g = ContextGraph()
+        reasoning = " " + "X" * 9999 + " "  # 10001 raw chars, 9999 after strip
+        decision_data = {
+            "outcome": "approved",
+            "confidence": 0.85,
+            "reasoning": reasoning,
+            "decision_maker": "bot",
+        }
+        result = g.enforce_decision_policy(decision_data)
+        # Matches record_decision, which measures reasoning after stripping
+        # surrounding whitespace.
+        assert len(result["warnings"]) == 0
+
+    def test_enforce_decision_policy_matches_record_decision_reasoning_limit(self):
+        g = ContextGraph()
+        g.record_decision(
+            category="loan_approval",
+            scenario="Application review",
+            reasoning="X" * 5000,  # Accepted by record_decision (<= 10000)
+            outcome="approved",
+            confidence=0.85,
+            decision_maker="underwriter_ai",
+        )
+        result = g.enforce_decision_policy(
+            {
+                "category": "loan_approval",
+                "outcome": "approved",
+                "confidence": 0.85,
+                "reasoning": "X" * 5000,
+                "decision_maker": "underwriter_ai",
+            }
+        )
+        # A decision that record_decision accepts must not trigger warnings
+        # under the default policy rules.
+        assert len(result["warnings"]) == 0
+        assert result["compliant"] is True
 
     def test_find_precedents_by_scenario_returns_list(self):
         g, _ = self._build_loan_graph()
@@ -981,6 +1063,17 @@ class TestParquetExportRealData:
     Requires: pyarrow (optional dep — tests skip if not installed).
     """
 
+    # ParquetExporter imports fine without pyarrow and only raises ImportError
+    # when an export actually runs, so guarding on that import never skips
+    # anything. Guard on the exporter's own availability flag instead: it is set
+    # by the same `import pyarrow` / `import pyarrow.parquet` the exporter gates
+    # on, so the skip condition cannot drift from the runtime check — including
+    # when pyarrow is present on the path but fails to import.
+    pytestmark = pytest.mark.skipif(
+        not PARQUET_AVAILABLE,
+        reason="pyarrow not installed",
+    )
+
     @pytest.fixture
     def kg_data(self):
         return {
@@ -1000,16 +1093,12 @@ class TestParquetExportRealData:
         }
 
     def test_parquet_exporter_importable(self):
-        try:
-            from semantica.export import ParquetExporter
-        except ImportError as e:
-            pytest.skip(f"ParquetExporter not available: {e}")
+        from semantica.export import ParquetExporter
+
+        assert ParquetExporter is not None
 
     def test_parquet_export_entities_to_file(self, kg_data, tmp_path):
-        try:
-            from semantica.export import ParquetExporter
-        except ImportError:
-            pytest.skip("pyarrow not installed")
+        from semantica.export import ParquetExporter
 
         exporter = ParquetExporter(compression="snappy")
         out_path = tmp_path / "github_entities.parquet"
@@ -1018,10 +1107,7 @@ class TestParquetExportRealData:
         assert out_path.stat().st_size > 0
 
     def test_parquet_export_relationships_to_file(self, kg_data, tmp_path):
-        try:
-            from semantica.export import ParquetExporter
-        except ImportError:
-            pytest.skip("pyarrow not installed")
+        from semantica.export import ParquetExporter
 
         exporter = ParquetExporter(compression="gzip")
         out_path = tmp_path / "github_relationships.parquet"
@@ -1030,10 +1116,7 @@ class TestParquetExportRealData:
         assert out_path.stat().st_size > 0
 
     def test_parquet_export_knowledge_graph(self, kg_data, tmp_path):
-        try:
-            from semantica.export import ParquetExporter
-        except ImportError:
-            pytest.skip("pyarrow not installed")
+        from semantica.export import ParquetExporter
 
         exporter = ParquetExporter(compression="snappy")
         base_path = tmp_path / "github_kg"
@@ -1043,30 +1126,24 @@ class TestParquetExportRealData:
         assert len(files) >= 1
 
     def test_parquet_export_snappy_compression(self, kg_data, tmp_path):
-        try:
-            from semantica.export import ParquetExporter
-        except ImportError:
-            pytest.skip("pyarrow not installed")
+        from semantica.export import ParquetExporter
+
         exporter = ParquetExporter(compression="snappy")
         out_path = tmp_path / "snappy_test.parquet"
         exporter.export_entities(kg_data["entities"], str(out_path))
         assert out_path.exists()
 
     def test_parquet_export_none_compression(self, kg_data, tmp_path):
-        try:
-            from semantica.export import ParquetExporter
-        except ImportError:
-            pytest.skip("pyarrow not installed")
+        from semantica.export import ParquetExporter
+
         exporter = ParquetExporter(compression="none")
         out_path = tmp_path / "uncompressed_test.parquet"
         exporter.export_entities(kg_data["entities"], str(out_path))
         assert out_path.exists()
 
     def test_parquet_convenience_function(self, kg_data, tmp_path):
-        try:
-            from semantica.export.methods import export_parquet
-        except ImportError:
-            pytest.skip("pyarrow not installed")
+        from semantica.export.methods import export_parquet
+
         out_path = tmp_path / "convenience_test.parquet"
         export_parquet(kg_data["entities"], str(out_path))
         assert out_path.exists()

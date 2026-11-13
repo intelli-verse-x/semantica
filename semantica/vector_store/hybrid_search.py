@@ -22,7 +22,7 @@ Example Usage:
     >>> from semantica.vector_store import HybridSearch, MetadataFilter
     >>> search = HybridSearch()
     >>> filter = MetadataFilter().eq("category", "science").gt("year", 2020)
-    >>> results = search.search(query_vector, vectors, metadata, vector_ids, filter=filter, k=10)
+    >>> results = search.search(query_vector, vectors, metadata, vector_ids, metadata_filter=filter, k=10)
     >>> 
     >>> from semantica.vector_store import SearchRanker
     >>> ranker = SearchRanker(strategy="reciprocal_rank_fusion")
@@ -35,6 +35,7 @@ Author: Semantica Contributors
 License: MIT
 """
 
+import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -135,6 +136,38 @@ class MetadataFilter:
                 return False
 
         return True
+
+
+def pop_legacy_filter(
+    options: Dict[str, Any],
+    metadata_filter: Optional["MetadataFilter"],
+    stacklevel: int = 3,
+) -> Optional["MetadataFilter"]:
+    """Take a ``MetadataFilter`` passed as ``filter=`` out of ``options``.
+
+    ``filter=`` is what the docs used to show, but the parameter is
+    ``metadata_filter``, so the filter went into ``**options`` and the search
+    ran unfiltered (#1802). Only a ``MetadataFilter`` is treated as the alias:
+    anything else (a plain dict, say) stays in ``options`` and is forwarded to
+    the backend as its native filter, as before. ``stacklevel`` points the
+    deprecation warning at the caller's line (3 = the caller of the function
+    that calls this helper).
+    """
+    legacy = options.get("filter")
+    if not isinstance(legacy, MetadataFilter):
+        return metadata_filter
+    if metadata_filter is not None:
+        raise TypeError(
+            "HybridSearch.search() got both 'filter' and 'metadata_filter'; "
+            "pass metadata_filter only"
+        )
+    del options["filter"]
+    warnings.warn(
+        "HybridSearch.search(filter=...) is deprecated, use metadata_filter=...",
+        DeprecationWarning,
+        stacklevel=stacklevel,
+    )
+    return legacy
 
 
 class SearchRanker:
@@ -298,9 +331,22 @@ class HybridSearch:
         Returns:
             List of search results
         """
-        # Handle legacy argument top_k
+        # Handle legacy argument top_k. Must be popped, not just read: it's
+        # later forwarded via **options to VectorStore.search_vectors(),
+        # which itself passes an explicit top_k=k to some backends (e.g.
+        # sqlite, pgvector) — a leftover 'top_k' in options collides with
+        # that and raises "got multiple values for keyword argument".
         if "top_k" in options:
-            k = options["top_k"]
+            k = options.pop("top_k")
+        metadata_filter = pop_legacy_filter(options, metadata_filter, stacklevel=3)
+        # query_vector is derived from `query` above; drop any stray value
+        # passed in **options so it doesn't collide with that derivation.
+        # (**options is a fresh dict per call, so this can't affect the caller.)
+        if "query_vector" in options:
+            self.logger.debug(
+                "Ignoring 'query_vector' passed in options; it is derived from 'query' instead."
+            )
+            options.pop("query_vector")
 
         tracking_id = self.progress_tracker.start_tracking(
             module="vector_store",
@@ -309,23 +355,8 @@ class HybridSearch:
         )
 
         try:
-            # Resolve vector store data if not provided
-            if vectors is None and self.vector_store:
-                vector_ids = list(self.vector_store.vectors.keys())
-                vectors = [self.vector_store.vectors[vid] for vid in vector_ids]
-                metadata = [self.vector_store.metadata.get(vid, {}) for vid in vector_ids]
-
-            if vectors is None or metadata is None:
-                 # Check if vectors/metadata are falsy (empty list) but not None
-                 # If they are None, we can't proceed. If they are empty lists, we return empty results.
-                 if vectors is None:
-                     vectors = []
-                 if metadata is None:
-                     metadata = []
-                 if vector_ids is None:
-                     vector_ids = []
-
-            # Handle string query
+            # Resolve the query vector first: it's needed both for local
+            # search below and for the backend-delegated path.
             if isinstance(query, str):
                 self.progress_tracker.update_tracking(
                     tracking_id, message="Generating query embedding..."
@@ -336,13 +367,88 @@ class HybridSearch:
                         self.embedding_generator = EmbeddingGenerator()
                     except (ImportError, OSError):
                         raise ImportError("EmbeddingGenerator not available for string queries")
-                
+
                 query_vector = self.embedding_generator.generate_embeddings(query, data_type="text")
                 # Handle if it returns batch (2D) or single (1D)
                 if len(query_vector.shape) == 2:
                      query_vector = query_vector[0]
             else:
-                query_vector = query
+                # Backend stores (e.g. FAISSStore.search_similar) assume an
+                # ndarray and call .ndim on it, so normalize list input here
+                # rather than relying on _vector_search's own conversion,
+                # which the backend-delegated path below bypasses.
+                query_vector = np.asarray(query) if isinstance(query, list) else query
+
+            # Resolve vector store data if not provided
+            if vectors is None and self.vector_store:
+                if getattr(self.vector_store, "backend", None) == "inmemory":
+                    # In-memory backend: read corpus directly from the local dicts.
+                    # We must NOT use this path for persistent backends (faiss,
+                    # weaviate, qdrant, milvus, pgvector, sqlite) even though
+                    # self.vector_store.vectors now exists as a mirror — the mirror
+                    # only reflects writes made through the facade in the current
+                    # session and would miss pre-existing backend data entirely.
+                    vector_ids = list(self.vector_store.vectors.keys())
+                    vectors = [self.vector_store.vectors[vid] for vid in vector_ids]
+                    metadata = [self.vector_store.metadata.get(vid, {}) for vid in vector_ids]
+                else:
+                    # Backend-agnostic path: all persistent backends (faiss, weaviate,
+                    # qdrant, milvus, pinecone, pgvector, sqlite) must go through the
+                    # store's public search API to cover the full index, including
+                    # data that predates the current session or was written externally.
+                    self.progress_tracker.update_tracking(
+                        tracking_id, message="Performing vector similarity search..."
+                    )
+                    fetch_k = k * (4 if metadata_filter else 2)
+                    backend_results = self.vector_store.search_vectors(
+                        query_vector=query_vector, k=fetch_k, **options
+                    )
+
+                    if metadata_filter:
+                        self.progress_tracker.update_tracking(
+                            tracking_id, message="Filtering by metadata..."
+                        )
+                        backend_results = [
+                            result
+                            for result in backend_results
+                            if metadata_filter.matches(result.get("metadata", {}))
+                        ]
+
+                    # Normalize to the same result schema the local search
+                    # path produces, since backends don't all return the
+                    # same set of keys. Unlike the local path (which always
+                    # knows distance = 1.0 - cosine_similarity), backends use
+                    # different metrics (L2, inner product, cosine, ...), so
+                    # a missing distance is left as None rather than guessed
+                    # from score — assuming cosine semantics would produce
+                    # nonsensical values for e.g. raw L2 distances.
+                    normalized_results = [
+                        {
+                            "id": result.get("id"),
+                            "score": result.get("score", 0.0),
+                            "distance": result.get("distance"),
+                            "metadata": result.get("metadata", {}),
+                        }
+                        for result in backend_results[:k]
+                    ]
+
+                    self.progress_tracker.stop_tracking(
+                        tracking_id,
+                        status="completed",
+                        message=f"Hybrid search completed: {len(normalized_results)} results",
+                    )
+                    return normalized_results
+
+            if vectors is None:
+                vectors = []
+            if metadata is None:
+                metadata = []
+            if vector_ids is None:
+                # IDs weren't provided alongside explicit vectors/metadata;
+                # generate stable positional ones so downstream indexing
+                # (e.g. filtered_ids[i], _vector_search's vector_ids[idx])
+                # doesn't operate on None.
+                vector_ids = [f"vec_{i}" for i in range(len(vectors))]
 
             # Check if vectors/metadata are empty
             # Handle both list and numpy array cases safely

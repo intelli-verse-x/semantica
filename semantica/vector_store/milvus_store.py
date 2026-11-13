@@ -13,6 +13,8 @@ Key Features:
     - Collection loading and release
     - Batch insert and search operations
     - Collection statistics and monitoring
+    - Connect via host/port (self-hosted server) or uri/token (Milvus Lite
+      file, remote server address, or Zilliz Cloud)
     - Optional dependency handling
 
 Main Classes:
@@ -31,17 +33,84 @@ Example Usage:
     >>> results = store.search_vectors(query_vector, limit=10, expr="category == 'science'")
     >>> stats = store.get_stats()
 
+    Or connect to Zilliz Cloud (or any uri-addressable Milvus) instead:
+    >>> store = MilvusStore(uri="https://<cluster>.zillizcloud.com", token="<api-key>")
+
 Author: Semantica Contributors
 License: MIT
 """
 
+import math
+import re
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
 from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+
+
+def _redact_uri(uri: str) -> str:
+    """Return a connection uri safe to log.
+
+    A uri may carry credentials as userinfo (``scheme://user:pass@host``) or
+    in query parameters (e.g. an embedded token); both would otherwise reach
+    the logger verbatim on every successful connection. Strip both, keeping
+    only scheme/host/port/path. A uri with no scheme/netloc (a local Milvus
+    Lite file path like ``"./milvus.db"``) carries no such secrets and is
+    returned unchanged.
+    """
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return "<redacted>"
+    if not parts.scheme and not parts.netloc:
+        return uri
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _validate_milvus_key(key: str) -> str:
+    """Validate and escape a metadata filter key for Milvus queries."""
+    if not key or not isinstance(key, str) or not re.match(r"^[a-zA-Z0-9_.-]+$", key):
+        raise ValidationError(f"Invalid metadata filter key: '{key}'")
+    return key.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _format_milvus_value(val: Any) -> str:
+    """Format and escape a filter value for Milvus expression syntax."""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    elif isinstance(val, (int, float)):
+        if isinstance(val, float) and not math.isfinite(val):
+            raise ValidationError(
+                f"Invalid metadata filter value: {val!r}. NaN/Infinity are not "
+                "valid Milvus expression literals."
+            )
+        return str(val)
+    elif isinstance(val, str):
+        escaped = (
+            val.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+        )
+        return f'"{escaped}"'
+    elif val is None:
+        return "null"
+    else:
+        escaped = (
+            str(val)
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+        )
+        return f'"{escaped}"'
 
 # Optional Milvus import
 try:
@@ -81,21 +150,44 @@ class MilvusClient:
         port: int = 19530,
         user: Optional[str] = None,
         password: Optional[str] = None,
+        uri: Optional[str] = None,
+        token: Optional[str] = None,
         **options,
     ) -> bool:
-        """Connect to Milvus server."""
+        """Connect to Milvus.
+
+        If ``uri`` is given (a Milvus Lite file path, a server address like
+        ``http://localhost:19530``, or a Zilliz Cloud endpoint), connect via
+        uri and ignore host/port — pymilvus treats uri and host/port as
+        mutually exclusive addressing, so passing both raises. user/password
+        and token are both still forwarded alongside uri: a self-hosted
+        server reached by uri may use RBAC user/password rather than a
+        token, so dropping them would silently strip valid credentials.
+        Otherwise fall back to the existing host/port/user/password server
+        connection.
+        """
         if not MILVUS_AVAILABLE:
             raise ProcessingError("Milvus not available")
 
         try:
-            connections.connect(
-                alias=self.alias,
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                **options,
-            )
+            if uri:
+                connections.connect(
+                    alias=self.alias,
+                    uri=uri,
+                    user=user,
+                    password=password,
+                    token=token,
+                    **options,
+                )
+            else:
+                connections.connect(
+                    alias=self.alias,
+                    host=host,
+                    port=port,
+                    user=user,
+                    password=password,
+                    **options,
+                )
             return True
         except Exception as e:
             raise ProcessingError(f"Failed to connect to Milvus: {str(e)}")
@@ -145,12 +237,19 @@ class MilvusCollection:
             raise ProcessingError("Milvus not available")
 
         try:
+            # Ensure "metadata" is always fetched; merge with any caller-supplied
+            # output_fields so that passing output_fields=["vector"] via **options
+            # does not raise a duplicate-keyword TypeError.
+            caller_fields = options.pop("output_fields", []) or []
+            merged_output_fields = list({"metadata", *caller_fields})
+
             search_results = self.collection.search(
                 data=[v.tolist() for v in vectors],
                 anns_field=anns_field,
                 param=param,
                 limit=limit,
                 expr=expr,
+                output_fields=merged_output_fields,
                 **options,
             )
 
@@ -162,9 +261,13 @@ class MilvusCollection:
                         {
                             "id": hit.id,
                             "distance": hit.distance,
-                            "score": 1.0 - hit.distance
-                            if hit.distance <= 1.0
-                            else 1.0 / (1.0 + hit.distance),
+                            "score": 1.0 / (1.0 + max(0.0, hit.distance)),
+                            # The collection schema defines a JSON metadata field
+                            # (see create_collection()). Return the stored value
+                            # so callers receive the same metadata as get_metadata()
+                            # and filter_by_metadata().
+                            "metadata": hit.entity.get("metadata") or {},
+                            "vector": None,
                         }
                     )
                 results.append(batch_results)
@@ -258,9 +361,26 @@ class MilvusStore:
         port: int = 19530,
         user: Optional[str] = None,
         password: Optional[str] = None,
+        uri: Optional[str] = None,
+        token: Optional[str] = None,
         **config,
     ):
-        """Initialize Milvus store."""
+        """Initialize Milvus store.
+
+        Args:
+            host: Milvus server host. Ignored when ``uri`` is set.
+            port: Milvus server port. Ignored when ``uri`` is set.
+            user: Username for server auth (RBAC). Used with either host/port
+                or uri.
+            password: Password for server auth (RBAC). Used with either
+                host/port or uri.
+            uri: Connection URI — a Milvus Lite file path (e.g.
+                ``"./milvus.db"``), a server address (e.g.
+                ``"http://localhost:19530"``), or a Zilliz Cloud endpoint.
+                Takes precedence over host/port when set.
+            token: Auth token for ``uri`` (e.g. a Zilliz Cloud API key).
+            **config: Additional backend config.
+        """
         self.logger = get_logger("milvus_store")
         self.config = config
         self.progress_tracker = get_progress_tracker()
@@ -271,6 +391,8 @@ class MilvusStore:
         self.port = port or config.get("port", 19530)
         self.user = user or config.get("user")
         self.password = password or config.get("password")
+        self.uri = uri or config.get("uri")
+        self.token = token or config.get("token")
 
         self.client: Optional[MilvusClient] = None
         self.collection: Optional[MilvusCollection] = None
@@ -304,10 +426,15 @@ class MilvusStore:
                 port=self.port,
                 user=self.user,
                 password=self.password,
+                uri=self.uri,
+                token=self.token,
                 **options,
             )
 
-            self.logger.info(f"Connected to Milvus at {self.host}:{self.port}")
+            if self.uri:
+                self.logger.info(f"Connected to Milvus at {_redact_uri(self.uri)}")
+            else:
+                self.logger.info(f"Connected to Milvus at {self.host}:{self.port}")
             return True
         except Exception as e:
             raise ProcessingError(f"Failed to connect to Milvus: {str(e)}")
@@ -342,9 +469,10 @@ class MilvusStore:
             # Define schema
             fields = [
                 FieldSchema(
-                    name="id", dtype=DataType.INT64, is_primary=True, auto_id=True
+                    name="id", dtype=DataType.VARCHAR, is_primary=True, auto_id=False, max_length=65535
                 ),
                 FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension),
+                FieldSchema(name="metadata", dtype=DataType.JSON),
             ]
 
             schema = CollectionSchema(
@@ -392,24 +520,74 @@ class MilvusStore:
                 raise ProcessingError(f"Collection {collection_name} does not exist")
 
             collection = Collection(collection_name)
+            # Reject schemas that don't match create_collection()'s shape:
+            # id/VARCHAR pk + vector + metadata. Otherwise an incompatible
+            # collection attaches and fails far later in get_vector/get_metadata.
+            schema = getattr(collection, "schema", None)
+            fields = list(getattr(schema, "fields", None) or [])
+            pk = [f for f in fields if getattr(f, "is_primary", False)]
+            if (
+                not pk
+                or pk[0].name != "id"
+                or getattr(getattr(pk[0], "dtype", None), "name", None) != "VARCHAR"
+                or getattr(pk[0], "auto_id", False)
+            ):
+                raise ProcessingError(
+                    f"Collection '{collection_name}' has an invalid primary key: "
+                    "expected VARCHAR field 'id' without auto_id"
+                )
+            vector_field = next((f for f in fields if f.name == "vector"), None)
+            if vector_field is None:
+                raise ProcessingError(
+                    f"Collection '{collection_name}' is missing required field 'vector'"
+                )
+            if (
+                getattr(getattr(vector_field, "dtype", None), "name", None)
+                != "FLOAT_VECTOR"
+            ):
+                raise ProcessingError(
+                    f"Collection '{collection_name}' has an invalid vector field: "
+                    "expected FLOAT_VECTOR 'vector'"
+                )
+            metadata_field = next((f for f in fields if f.name == "metadata"), None)
+            if metadata_field is None:
+                raise ProcessingError(
+                    f"Collection '{collection_name}' is missing required field 'metadata'"
+                )
+            if getattr(getattr(metadata_field, "dtype", None), "name", None) != "JSON":
+                raise ProcessingError(
+                    f"Collection '{collection_name}' has an invalid metadata field: "
+                    "expected JSON 'metadata'"
+                )
+
             self.collection = MilvusCollection(collection, collection_name)
             self.search_engine = MilvusSearch(self.collection)
             return self.collection
         except Exception as e:
             raise ProcessingError(f"Failed to get collection: {str(e)}")
 
-    def insert_vectors(
-        self, vectors: List[Union[np.ndarray, List[float]]], **options
-    ) -> Any:
+    def insert_vectors(self, vectors: List[Union[np.ndarray, List[float]]], **options) -> Any:
+        """Backward compatibility alias for add_vectors."""
+        return self.add_vectors(vectors, **options)
+
+    def add_vectors(
+        self, 
+        vectors: List[Union[np.ndarray, List[float]]], 
+        ids: Optional[List[str]] = None,
+        metadata: Optional[List[Dict[str, Any]]] = None,
+        **options
+    ) -> List[str]:
         """
-        Insert vectors into collection.
+        Add vectors to collection.
 
         Args:
             vectors: List of vectors
+            ids: Optional list of vector IDs
+            metadata: Optional list of metadata dictionaries
             **options: Additional options
 
         Returns:
-            Insert result
+            List of vector IDs
         """
         tracking_id = self.progress_tracker.start_tracking(
             module="vector_store",
@@ -442,7 +620,15 @@ class MilvusStore:
                     vector = vector.tolist()
                 vector_data.append(vector)
 
-            data = [vector_data]
+            import uuid
+            if ids is None:
+                ids = [str(uuid.uuid4()) for _ in range(len(vectors))]
+                
+            if metadata is None:
+                metadata = [{} for _ in range(len(vectors))]
+
+            data = [ids, vector_data, metadata]
+            
             self.progress_tracker.update_tracking(
                 tracking_id, message="Inserting vectors into collection..."
             )
@@ -453,7 +639,7 @@ class MilvusStore:
                 status="completed",
                 message=f"Inserted {len(vectors)} vectors",
             )
-            return result
+            return ids
 
         except Exception as e:
             self.progress_tracker.stop_tracking(
@@ -522,6 +708,210 @@ class MilvusStore:
                 tracking_id, status="failed", message=str(e)
             )
             raise
+
+    def delete_vectors(self, vector_ids: List[str], **options) -> Dict[str, Any]:
+        """Delete vectors from collection by their ids.
+
+        Args:
+            vector_ids: Vector ids to delete
+            **options: Additional options
+
+        Returns:
+            A dict with the number of matching entities that were deleted
+            (``delete_count``).
+        """
+        if self.collection is None:
+            raise ProcessingError(
+                "Collection not initialized. Call create_collection() or get_collection() first."
+            )
+
+        if not vector_ids:
+            return {"delete_count": 0}
+
+        try:
+            # Milvus DELETE deletes by expression. Escape each id so a quote or
+            # backslash in an id cannot break out of the string literal.
+            if len(vector_ids) == 1:
+                expr = f"id == {_format_milvus_value(vector_ids[0])}"
+            else:
+                formatted = ", ".join(_format_milvus_value(i) for i in vector_ids)
+                expr = f"id in [{formatted}]"
+            result = self.collection.collection.delete(expr=expr, **options)
+            delete_count = getattr(result, "delete_count", 0)
+            if delete_count is None:
+                delete_count = 0
+            elif isinstance(delete_count, (str, bytes)):
+                try:
+                    delete_count = int(delete_count)
+                except (TypeError, ValueError):
+                    delete_count = 0
+            return {"delete_count": delete_count}
+        except Exception as e:
+            raise ProcessingError(f"Failed to delete vectors: {str(e)}")
+
+    def get_vector(self, vector_id: str) -> Optional[np.ndarray]:
+        """Get vector by ID."""
+        if not MILVUS_AVAILABLE or not self.collection:
+            return None
+
+        try:
+            safe_id = vector_id.replace("\\", "\\\\").replace('"', '\\"')
+            res = self.collection.collection.query(
+                expr=f'id == "{safe_id}"',
+                output_fields=["vector"]
+            )
+            if res and len(res) > 0:
+                return np.array(res[0]["vector"])
+            return None
+        except Exception:
+            return None
+
+    def get_metadata(self, vector_id: str) -> Optional[Dict[str, Any]]:
+        """Get metadata by ID."""
+        if not MILVUS_AVAILABLE or not self.collection:
+            return None
+
+        try:
+            safe_id = vector_id.replace("\\", "\\\\").replace('"', '\\"')
+            res = self.collection.collection.query(
+                expr=f'id == "{safe_id}"',
+                output_fields=["metadata"]
+            )
+            if res and len(res) > 0:
+                return res[0].get("metadata", {})
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _record_to_result(item: Dict[str, Any]) -> Dict[str, Any]:
+        vec = item.get("vector")
+        return {
+            "id": str(item.get("id")),
+            "metadata": item.get("metadata") or {},
+            "vector": np.array(vec) if vec is not None else None,
+        }
+
+    def filter_by_metadata(
+        self, filters: Dict[str, Any], limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter vectors by metadata using Milvus expression filtering.
+
+        Args:
+            filters: Metadata filter criteria
+            limit: Maximum number of results
+
+        Returns:
+            List of matching result dicts with 'id', 'metadata', and 'vector'
+        """
+        if self.collection is None or not MILVUS_AVAILABLE:
+            return []
+
+        expr_parts = []
+        if filters:
+            for key, value in filters.items():
+                safe_key = _validate_milvus_key(key)
+                if isinstance(value, dict):
+                    if "min" in value and value["min"] is not None:
+                        min_val = _format_milvus_value(value["min"])
+                        expr_parts.append(f'metadata["{safe_key}"] >= {min_val}')
+                    if "max" in value and value["max"] is not None:
+                        max_val = _format_milvus_value(value["max"])
+                        expr_parts.append(f'metadata["{safe_key}"] <= {max_val}')
+                elif isinstance(value, list):
+                    formatted_vals = [_format_milvus_value(v) for v in value]
+                    expr_parts.append(
+                        f'metadata["{safe_key}"] in [{", ".join(formatted_vals)}]'
+                    )
+                else:
+                    formatted_val = _format_milvus_value(value)
+                    expr_parts.append(f'metadata["{safe_key}"] == {formatted_val}')
+
+        expr = " and ".join(expr_parts) if expr_parts else "id != ''"
+
+        try:
+            query_results = self.collection.collection.query(
+                expr=expr,
+                limit=limit,
+                output_fields=["id", "vector", "metadata"],
+            )
+            return [self._record_to_result(item) for item in query_results]
+        except Exception as e:
+            self.logger.warning(f"Failed to query Milvus vectors by metadata expression: {e}")
+            return []
+
+    def iter_all(self, batch_size: int = 500):
+        """
+        Iterate over every stored entity using Milvus's query iterator.
+
+        Paginates by primary-key cursor rather than row offset, which is why
+        this exists instead of scan_vectors(offset, limit). query(offset=...)
+        is capped by the 16384 result window and would truncate anything
+        larger.
+
+        Assumes the schema create_collection() builds: a VARCHAR `id` primary
+        key plus vector and metadata fields, as get_vector() and
+        filter_by_metadata() already do. get_collection() does not validate
+        schema, so a collection with an integer key or no metadata field fails
+        here.
+
+        Args:
+            batch_size: Entities to request per iterator batch
+
+        Yields:
+            Result dicts with 'id', 'metadata', and 'vector', in cursor order
+
+        Raises:
+            ProcessingError: If the collection is not initialized, or the
+                installed pymilvus does not expose query_iterator().
+        """
+        if self.collection is None:
+            raise ProcessingError(
+                "Collection not initialized. Call create_collection() or get_collection() first."
+            )
+
+        if not MILVUS_AVAILABLE:
+            raise ProcessingError("Milvus not available")
+
+        query_iterator = getattr(self.collection.collection, "query_iterator", None)
+        if not callable(query_iterator):
+            raise ProcessingError(
+                "This pymilvus version does not expose Collection.query_iterator(), "
+                "which full enumeration requires. Falling back to query(offset=...) "
+                "is not safe here: it is capped by the 16384 result window and would "
+                "silently truncate a larger collection."
+            )
+
+        # Query operations need a loaded collection. Idempotent, and once per
+        # scan rather than per batch.
+        self.collection.load()
+
+        # Milvus rejects an empty expression; this match-all form is what
+        # filter_by_metadata() already uses.
+        iterator = query_iterator(
+            batch_size=batch_size,
+            expr="id != ''",
+            output_fields=["id", "vector", "metadata"],
+        )
+
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    return
+                for item in batch:
+                    yield self._record_to_result(item)
+        finally:
+            # Release the server-side iterator even if the consumer stops early.
+            # Swallowed so a broken connection at cleanup time doesn't replace
+            # whatever real exception was already propagating out of the try.
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as e:
+                    self.logger.warning(f"Failed to close Milvus query iterator: {e}")
 
     def get_stats(self, collection_name: Optional[str] = None) -> Dict[str, Any]:
         """Get collection statistics."""

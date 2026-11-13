@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Union
 from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+from .query_sanitize import sanitize_identifier
 
 # Optional Neo4j import
 try:
@@ -48,6 +49,7 @@ try:
         ServiceUnavailable,
         TransactionError,
     )
+    from neo4j.graph import Node, Relationship
 
     NEO4J_AVAILABLE = True
 except (ImportError, OSError):
@@ -57,6 +59,53 @@ except (ImportError, OSError):
     AuthError = Exception
     ServiceUnavailable = Exception
     TransactionError = Exception
+    Node = None  # type: ignore[assignment,misc]
+    Relationship = None  # type: ignore[assignment,misc]
+
+
+def _convert_query_value(value: Any) -> Any:
+    """Convert a Neo4j record value to plain Python data, recursively.
+
+    Node and Relationship implement the Mapping protocol while __iter__
+    yields property *keys*, so entities must be matched before the
+    generic branches — otherwise they degrade to a list of property
+    names (#1727). Entities are expanded to a plain dict of their stored
+    properties plus identity metadata under reserved, underscore-prefixed
+    keys: "_labels" (sorted list) for nodes, "_type" (string) for
+    relationships, and "_element_id" (string) for both.
+
+    The "_"-prefixed namespace is reserved by convention so user
+    properties named "labels", "type", or "element_id" (no underscore)
+    are never shadowed. User properties that themselves start with "_"
+    (e.g. "_labels", "_type", "_element_id") will be overwritten by the
+    corresponding identity key; such names should not be used as Neo4j
+    property names in schemas managed by this library.
+
+    Scalar Neo4j property values that have no Python built-in equivalent
+    (neo4j.time.DateTime, Date, Time) are returned as-is from the driver
+    and are NOT JSON-serializable. Properties that are tuples internally
+    (neo4j.time.Duration, neo4j.spatial.Point) are expanded to lists by
+    the generic ``__iter__`` branch and ARE JSON-serializable. String,
+    integer, float, bool, and None properties are always JSON-safe.
+
+    Containers (list, dict, Cypher maps) and nested entity values are
+    converted recursively. neo4j.graph.Path objects are iterable over
+    their relationships only; all path-node data is absent from the
+    converted output (see notes on Path in the module docstring).
+    """
+    if NEO4J_AVAILABLE and isinstance(value, (Node, Relationship)):
+        converted = dict(value)
+        if isinstance(value, Node):
+            converted["_labels"] = sorted(value.labels)
+        else:
+            converted["_type"] = value.type
+        converted["_element_id"] = value.element_id
+        return converted
+    if hasattr(value, "items"):
+        return {key: _convert_query_value(v) for key, v in value.items()}
+    if hasattr(value, "__iter__") and not isinstance(value, (str, dict)):
+        return [_convert_query_value(v) for v in value]
+    return value
 
 
 class Neo4jDriver:
@@ -366,7 +415,7 @@ class Neo4jStore:
         )
 
         try:
-            label_str = ":".join(labels)
+            label_str = ":".join(sanitize_identifier(l, "label") for l in labels)
             query = f"CREATE (n:{label_str} $props) RETURN id(n) as id, n"
 
             with self.get_session() as session:
@@ -424,7 +473,7 @@ class Neo4jStore:
                     labels = node.get("labels", [])
                     properties = node.get("properties", {})
 
-                    label_str = ":".join(labels) if labels else "Node"
+                    label_str = ":".join(sanitize_identifier(l, "label") for l in labels) if labels else "Node"
                     query = f"CREATE (n:{label_str} $props) RETURN id(n) as id, n"
 
                     result = session.run(query, {"props": properties})
@@ -502,10 +551,20 @@ class Neo4jStore:
         Returns:
             List of matching nodes
         """
+        # LIMIT can't be bound as a query parameter in a way Neo4j accepts
+        # here, so it's interpolated directly; validate explicitly rather
+        # than trust the `limit: int` type hint, which Python doesn't
+        # enforce at runtime. Done outside the try/except below so a bad
+        # limit raises ValidationError, not a generic ProcessingError.
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"Invalid limit: {limit!r}") from exc
+
         try:
             # Build query
             if labels:
-                label_str = ":".join(labels)
+                label_str = ":".join(sanitize_identifier(l, "label") for l in labels)
                 query = f"MATCH (n:{label_str})"
             else:
                 query = "MATCH (n)"
@@ -514,7 +573,8 @@ class Neo4jStore:
             if properties:
                 conditions = []
                 for key, value in properties.items():
-                    conditions.append(f"n.{key} = ${key}")
+                    safe_key = sanitize_identifier(key, "property key")
+                    conditions.append(f"n.{safe_key} = ${safe_key}")
                 query += " WHERE " + " AND ".join(conditions)
 
             query += f" RETURN id(n) as id, n, labels(n) as labels LIMIT {limit}"
@@ -635,10 +695,11 @@ class Neo4jStore:
 
         try:
             properties = properties or {}
+            safe_rel_type = sanitize_identifier(rel_type, "relationship type")
             query = f"""
                 MATCH (a), (b)
                 WHERE id(a) = $start_id AND id(b) = $end_id
-                CREATE (a)-[r:{rel_type} $props]->(b)
+                CREATE (a)-[r:{safe_rel_type} $props]->(b)
                 RETURN id(r) as id, type(r) as type, r
             """
 
@@ -695,8 +756,17 @@ class Neo4jStore:
         Returns:
             List of matching relationships
         """
+        # See get_nodes: LIMIT is interpolated directly, so validate
+        # explicitly rather than trust the unenforced `limit: int` hint,
+        # outside the try/except below so a bad limit raises
+        # ValidationError, not a generic ProcessingError.
         try:
-            type_filter = f":{rel_type}" if rel_type else ""
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"Invalid limit: {limit!r}") from exc
+
+        try:
+            type_filter = f":{sanitize_identifier(rel_type, 'relationship type')}" if rel_type else ""
 
             if node_id is not None:
                 if direction == "out":
@@ -785,7 +855,15 @@ class Neo4jStore:
             **options: Additional options
 
         Returns:
-            Query results
+            Query results: dict with "success", "records", "keys" and
+            "metadata". Record values are converted recursively by
+            ``_convert_query_value``: Node and Relationship objects
+            become plain dicts of their stored properties plus identity
+            keys "_labels" / "_type" and "_element_id"; lists and Cypher
+            maps are recursed into. Scalar Neo4j temporal values
+            (DateTime, Date, Time) pass through as driver objects and
+            are not JSON-serializable; all other common property types
+            (str, int, float, bool, None, Duration, Point) are.
         """
         tracking_id = self.progress_tracker.start_tracking(
             module="graph_store",
@@ -804,17 +882,9 @@ class Neo4jStore:
                     if not keys:
                         keys = list(record.keys())
 
-                    row = {}
-                    for key in keys:
-                        value = record[key]
-                        # Convert Neo4j types to Python types
-                        if hasattr(value, "__iter__") and not isinstance(value, (str, dict)):
-                            row[key] = list(value)
-                        elif hasattr(value, "items"):
-                            row[key] = dict(value)
-                        else:
-                            row[key] = value
-                    records.append(row)
+                    records.append(
+                        {key: _convert_query_value(record[key]) for key in keys}
+                    )
 
                 self.progress_tracker.stop_tracking(
                     tracking_id,
@@ -857,7 +927,8 @@ class Neo4jStore:
             List of neighboring nodes with path information
         """
         try:
-            type_filter = f":{rel_type}" if rel_type else ""
+            type_filter = f":{sanitize_identifier(rel_type, 'relationship type')}" if rel_type else ""
+            depth = int(depth)
 
             if direction == "out":
                 pattern = f"-[r{type_filter}*1..{depth}]->"
@@ -910,7 +981,8 @@ class Neo4jStore:
             Shortest path information or None if not found
         """
         try:
-            type_filter = f":{rel_type}" if rel_type else ""
+            type_filter = f":{sanitize_identifier(rel_type, 'relationship type')}" if rel_type else ""
+            max_depth = int(max_depth)
 
             query = f"""
                 MATCH path = shortestPath((start)-[r{type_filter}*..{max_depth}]-(end))
@@ -975,17 +1047,22 @@ class Neo4jStore:
             True if index created successfully
         """
         try:
-            index_name = options.get("index_name", f"idx_{label}_{property_name}")
+            safe_label = sanitize_identifier(label, "label")
+            safe_property = sanitize_identifier(property_name, "property key")
+            index_name = sanitize_identifier(
+                options.get("index_name", f"idx_{safe_label}_{safe_property}"),
+                "index name",
+            )
 
             if index_type == "fulltext":
                 query = f"""
                     CREATE FULLTEXT INDEX {index_name} IF NOT EXISTS
-                    FOR (n:{label}) ON EACH [n.{property_name}]
+                    FOR (n:{safe_label}) ON EACH [n.{safe_property}]
                 """
             else:
                 query = f"""
                     CREATE INDEX {index_name} IF NOT EXISTS
-                    FOR (n:{label}) ON (n.{property_name})
+                    FOR (n:{safe_label}) ON (n.{safe_property})
                 """
 
             with self.get_session() as session:

@@ -6,17 +6,22 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
+from ..context.agent_memory import AgentMemory
 from ..context.context_graph import ContextGraph
+from ..provenance.manager import storage_path_from_env
+from .dependencies import anonymous_access_allowed, get_expected_api_key, require_auth
+from .markdown_resources import MarkdownResourceRegistry
+from .runtime import explorer_capabilities, install_mutation_bridge
 from .session import GraphSession
-from .ws import ConnectionManager
+from .ws import ConnectionManager, install_graph_updates_websocket
 
 
 def _read_int_env(name: str, default: int) -> int:
@@ -35,7 +40,10 @@ def _read_explorer_settings() -> dict:
     elif "EXPLORER_CORS_ORIGINS" in os.environ:
         raw_origins = os.environ["EXPLORER_CORS_ORIGINS"]
     else:
-        raw_origins = "http://localhost:5173,http://127.0.0.1:5173"
+        raw_origins = (
+            "http://localhost:5173,http://127.0.0.1:5173,"
+            "http://localhost:8000,http://127.0.0.1:8000"
+        )
     return {
         "allowed_origins": [
             origin.strip() for origin in raw_origins.split(",") if origin.strip()
@@ -45,45 +53,36 @@ def _read_explorer_settings() -> dict:
         # ContextGraph and does not open a network connection to FalkorDB.
         "falkordb_host": os.environ.get("FALKORDB_HOST", "localhost"),
         "falkordb_port": _read_int_env("FALKORDB_PORT", 6379),
-        "provenance_storage_path": os.environ.get(
-            "SEMANTICA_PROVENANCE_DB",
-            os.environ.get("EXPLORER_PROVENANCE_DB"),
-        ),
+        "provenance_storage_path": storage_path_from_env(),
     }
-
-
-def _install_mutation_bridge(app: FastAPI, session: GraphSession) -> None:
-    if getattr(session.graph, "_mutation_bridge_installed", False):
-        return
-    session.graph._mutation_bridge_installed = True
-    previous_callback = getattr(session.graph, "mutation_callback", None)
-
-    def on_mutation(event_type: str, entity_id: str, payload: dict) -> None:
-        session.handle_graph_mutation(event_type, entity_id, payload)
-        if callable(previous_callback):
-            previous_callback(event_type, entity_id, payload)
-        loop = getattr(app.state, "event_loop", None)
-        manager = getattr(app.state, "ws_manager", None)
-        if loop is None or manager is None or loop.is_closed():
-            return
-        message = {
-            "event_type": event_type,
-            "entity_id": entity_id,
-            "payload": payload,
-        }
-        asyncio.run_coroutine_threadsafe(
-            manager.broadcast("graph_mutation", message),
-            loop,
-        )
-
-    session.graph.mutation_callback = on_mutation
 
 
 def create_app(
     session: Optional[GraphSession] = None,
     provenance_storage_path: Optional[str] = None,
+    agent_memory: Optional[AgentMemory] = None,
+    allowed_origins: Optional[Sequence[str]] = None,
 ) -> FastAPI:
+    """Create an Explorer application over live graph and memory objects.
+
+    Args:
+        session: Graph session exposed by the Explorer. A new in-memory graph
+            session is created when omitted.
+        provenance_storage_path: Optional per-app provenance database path.
+        agent_memory: Existing AgentMemory instance to expose in the Memories
+            workspace. The workspace is unavailable when omitted.
+        allowed_origins: Optional custom sequence of allowed CORS/WebSocket
+            origins. When omitted, origins are read from ALLOWED_ORIGINS (or
+            EXPLORER_CORS_ORIGINS) or default to standard localhost origins.
+
+    Returns:
+        Configured FastAPI application.
+    """
     settings = _read_explorer_settings()
+    if allowed_origins is not None:
+        settings["allowed_origins"] = [
+            origin.strip() for origin in allowed_origins if origin.strip()
+        ]
     prov_path = provenance_storage_path or settings.get("provenance_storage_path")
     if session is None:
         active_session = GraphSession(
@@ -94,13 +93,32 @@ def create_app(
         active_session = session
         if prov_path is not None:
             active_session.set_provenance_storage_path(prov_path)
+    markdown_resources = MarkdownResourceRegistry(active_session.graph, agent_memory)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        import logging as _lifespan_logging
+        _lifespan_logger = _lifespan_logging.getLogger(__name__)
+        if anonymous_access_allowed():
+            _lifespan_logger.warning(
+                "Explorer is running with SEMANTICA_ALLOW_ANONYMOUS=true — "
+                "all API routes are unauthenticated. Do not expose this "
+                "process beyond localhost."
+            )
+        elif get_expected_api_key():
+            _lifespan_logger.info("Explorer API authentication: enabled (SEMANTICA_API_KEY set).")
+        else:
+            _lifespan_logger.warning(
+                "Explorer API authentication: NOT CONFIGURED. All protected "
+                "routes will return 503 until SEMANTICA_API_KEY is set."
+            )
+
         app.state.event_loop = asyncio.get_running_loop()
         app.state.ws_manager = ConnectionManager()
         app.state.session = active_session
-        _install_mutation_bridge(app, active_session)
+        app.state.agent_memory = agent_memory
+        app.state.markdown_resources = markdown_resources
+        install_mutation_bridge(app, active_session)
         yield
 
     app = FastAPI(
@@ -113,17 +131,17 @@ def create_app(
     app.state.explorer_settings = settings
 
     # allow_credentials lets browsers send cookies/auth headers cross-origin.
-    # The Explorer has no authentication, so credentials serve no purpose and
-    # enabling them when origins are broadened creates cross-site request risk.
-    # Set EXPLORER_CORS_CREDENTIALS=true explicitly to opt in (e.g. for a
-    # reverse-proxy setup that injects its own auth layer).
+    # Credentials aren't needed for the X-API-Key auth scheme below, and
+    # enabling them when origins are broadened creates cross-site request
+    # risk. Set EXPLORER_CORS_CREDENTIALS=true explicitly to opt in (e.g.
+    # for a reverse-proxy setup that injects its own cookie-based auth).
     _allow_credentials = os.environ.get("EXPLORER_CORS_CREDENTIALS", "false").lower() == "true"
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings["allowed_origins"],
         allow_credentials=_allow_credentials,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "X-API-Key"],
         max_age=600,
     )
 
@@ -153,41 +171,30 @@ def create_app(
     from .routes.enrich import router as enrich_router
     from .routes.export_import import router as export_import_router
     from .routes.graph import router as graph_router
+    from .routes.markdown import router as markdown_router
+    from .routes.memories import router as memories_router
     from .routes.ontology import router as ontology_router
     from .routes.provenance import router as provenance_router
     from .routes.sparql import router as sparql_router
     from .routes.temporal import router as temporal_router
     from .routes.vocabulary import router as vocabulary_router
 
-    app.include_router(graph_router)
-    app.include_router(analytics_router)
-    app.include_router(decisions_router)
-    app.include_router(temporal_router)
-    app.include_router(enrich_router)
-    app.include_router(export_import_router)
-    app.include_router(annotations_router)
-    app.include_router(sparql_router)
-    app.include_router(provenance_router)
-    app.include_router(vocabulary_router)
-    app.include_router(ontology_router)
+    _auth = [Depends(require_auth)]
+    app.include_router(graph_router, dependencies=_auth)
+    app.include_router(analytics_router, dependencies=_auth)
+    app.include_router(decisions_router, dependencies=_auth)
+    app.include_router(temporal_router, dependencies=_auth)
+    app.include_router(enrich_router, dependencies=_auth)
+    app.include_router(export_import_router, dependencies=_auth)
+    app.include_router(markdown_router, dependencies=_auth)
+    app.include_router(memories_router, dependencies=_auth)
+    app.include_router(annotations_router, dependencies=_auth)
+    app.include_router(sparql_router, dependencies=_auth)
+    app.include_router(provenance_router, dependencies=_auth)
+    app.include_router(vocabulary_router, dependencies=_auth)
+    app.include_router(ontology_router, dependencies=_auth)
 
-    _WS_MAX_MESSAGE_BYTES = 64 * 1024  # 64 KB — control messages only
-
-    @app.websocket("/ws/graph-updates")
-    async def websocket_endpoint(websocket: WebSocket):
-        manager: ConnectionManager = app.state.ws_manager
-        await manager.connect(websocket)
-        await manager.send_personal(websocket, "connection_ack", {"connected": True})
-        try:
-            while True:
-                message = await websocket.receive_text()
-                if len(message) > _WS_MAX_MESSAGE_BYTES:
-                    await websocket.close(code=1009)  # 1009 = message too big
-                    break
-                if message.strip().lower() == "ping":
-                    await manager.send_personal(websocket, "pong", {"ok": True})
-        except WebSocketDisconnect:
-            manager.disconnect(websocket)
+    install_graph_updates_websocket(app, settings["allowed_origins"])
 
     @app.get("/", include_in_schema=False)
     async def root():
@@ -226,6 +233,7 @@ def create_app(
             "name": "Semantica Knowledge Explorer",
             "version": __version__,
             "status": "active",
+            "capabilities": explorer_capabilities(agent_memory),
         }
 
     static_dir = Path(__file__).resolve().parent.parent / "static"

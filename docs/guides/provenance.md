@@ -241,15 +241,14 @@ Every `ProvenanceEntry` carries a SHA-256 checksum computed at write time. If an
 Integrity verification is critical for regulatory compliance and forensic analysis. Run integrity checks as part of any compliance audit:
 
 ```python
-from semantica.provenance.integrity import compute_checksum
+from semantica.provenance.integrity import verify_checksum
 
 raw_entries = prov.trace_lineage("cve-2024-3400")
 
 print("Integrity check:")
 for e in raw_entries:
     stored   = e.checksum
-    computed = compute_checksum(e)
-    status   = "OK" if stored == computed else "TAMPERED"
+    status   = "OK" if verify_checksum(e) else "TAMPERED"
     print(f"  [{status}] {e.entity_id[:50]}  {(stored or '')[:16]}...")
 ```
 
@@ -333,7 +332,7 @@ This summary is the starting point for a compliance attestation: you can state t
 
 **Overusing provenance in low-value scenarios.** Recording provenance for every intermediate calculation or temporary variable creates storage overhead without compliance benefit. Focus provenance tracking on entities, relationships, and properties that have legal, regulatory, or business significance.
 
-**Failing to validate integrity checksums.** Cryptographic integrity verification only works if you actually check it. Include regular `compute_checksum()` validation in audit workflows and incident response procedures.
+**Failing to validate integrity checksums.** Cryptographic integrity verification only works if you actually check it. Include regular `verify_checksum()` validation in audit workflows and incident response procedures.
 
 **Mixing provenance granularities.** Tracking some entities at the document level and others at the sentence level creates inconsistent audit trails. Establish consistent granularity standards for each data type and processing workflow.
 
@@ -424,7 +423,7 @@ The version chain created by repeated `track_entity()` calls on the same `entity
 ```python
 from semantica.provenance import ProvenanceManager
 from semantica.provenance.schemas import SourceReference
-from semantica.provenance.integrity import compute_checksum
+from semantica.provenance.integrity import verify_checksum
 
 prov = ProvenanceManager(storage_path="soc_provenance.db")
 
@@ -466,7 +465,7 @@ print(f"Update count    : {lineage['entity_count']} records")
 # Integrity check before relying on the record for a patch decision
 entries = prov.trace_lineage("cve-2023-44487")
 for e in entries:
-    ok = compute_checksum(e) == e.checksum
+    ok = verify_checksum(e)
     print(f"  [{('OK' if ok else 'TAMPERED')}] {e.timestamp[:19]}  source={e.source_document}")
 ```
 
@@ -481,7 +480,7 @@ A clinical evidence graph tracks efficacy data from source publications through 
 ```python
 from semantica.provenance import ProvenanceManager
 from semantica.provenance.schemas import SourceReference
-from semantica.provenance.integrity import compute_checksum
+from semantica.provenance.integrity import verify_checksum
 
 prov = ProvenanceManager(storage_path="clinical_provenance.db")
 
@@ -534,7 +533,7 @@ for entry in lineage["lineage_chain"]:
 # Integrity verification (21 CFR Part 11 requirement)
 entries = prov.trace_lineage("VE_primary_BNT162b2_C4591001")
 for e in entries:
-    status = "OK" if compute_checksum(e) == e.checksum else "TAMPERED"
+    status = "OK" if verify_checksum(e) else "TAMPERED"
     print(f"  Integrity [{status}]: {e.entity_id}")
 
 stats = prov.get_statistics()
@@ -633,16 +632,33 @@ Every `ProvenanceEntry` maps directly to W3C PROV-O terms. If your compliance te
 | :--- | :--- | :--- |
 | `prov:Entity` | `entity_id` | The tracked object — entity, chunk, relationship, or property |
 | `prov:Activity` | `activity_id` | The process that produced it — `"ner_extraction"`, `"bureau_parsing"` |
-| `prov:Agent` | `agent_id` | Who ran the activity — pipeline name, analyst ID |
-| `prov:wasDerivedFrom` | `parent_entity_id` | The previous version of this entity — enables version chaining |
+| `prov:Agent` / `prov:Person` / `prov:SoftwareAgent` / `prov:Organization` | `agent_id`, `agent_type`, `is_automated` | Who — or what — ran the activity, and whether a human was directly accountable |
+| `prov:qualifiedAssociation` + `prov:hadRole` | `role` | The agent's role for this specific entity — `"generator"` (default), `"approver"`, `"reviewer"` — for sign-off/four-eyes workflows |
+| `prov:wasDerivedFrom` | `parent_entity_id` (legacy combined field) | The previous version or source of this entity |
+| — | `previous_version_id` | This entry corrects/replaces a prior version of the *same* fact |
+| `prov:wasDerivedFrom` | `derived_from_id` | This entry was derived from a *different* source entity |
 | `prov:used` | `used_entities` | Entity IDs consumed to produce this one |
-| `prov:generatedAtTime` | `timestamp` | ISO datetime, auto-set to `datetime.utcnow()` at write time |
+| `prov:generatedAtTime` | `timestamp` | ISO datetime, auto-set to `utc_now_iso()` at write time |
+| `prov:qualifiedInvalidation` | `invalidated`, `invalidated_at_time`, `invalidated_by`, `invalidation_reason` | A retraction/correction recorded as a tombstone via `ProvenanceManager.invalidate()`, never a hard delete |
+| `prov:startedAtTime` / `prov:endedAtTime` | `activity_started_at_time`, `activity_ended_at_time` | Typed Activity timing — pass an `ActivityRecord` via the `activity=` kwarg to set these together with `activity_id` |
+| `prov:qualifiedGeneration`/`Generation`, `qualifiedUsage`/`Usage`, `qualifiedDerivation`/`Derivation` | (derived from the fields above) | Additive qualified forms of `wasGeneratedBy`/`used`/`wasDerivedFrom`, emitted automatically alongside the plain triples |
+| `prov:wasAssociatedWith` | (derived from `agent_id`) | Direct Activity→Agent link, distinct from the Entity→Agent `wasAttributedTo` |
+| `prov:actedOnBehalfOf` | `acted_on_behalf_of` | Agent→Agent delegation — e.g. an automated agent acting on behalf of the human/organization that authorized it |
+| `prov:wasInformedBy` | `informed_by_activities` (pass as `informed_by=[...]`) | Chains this entry's activity to prior activities it was informed by (e.g. a pipeline stage informed by the stage before it) |
+| `prov:Bundle` + `prov:hadMember` | `bundle_id` | Groups entries by source/dataset/ingestion-run (membership triples, not true RDF named-graph partitioning) |
+| — | `valid_from`, `valid_until`, `revision_type`, `supersedes` | Bitemporal fields merged from the deprecated `kg.ProvenanceTracker` — always caller-supplied (never auto-computed), surfaced via `ProvenanceManager.revision_history()`, which falls back to timestamp-based derivation for entries that don't set them explicitly |
 
-The `checksum` field is not part of the PROV-O standard — it is Semantica's tamper-detection extension. Every entry's SHA-256 is computed from its content fields at write time and can be recomputed at any time to verify the record has not been modified.
+`previous_version_id` and `derived_from_id` are additive alongside `parent_entity_id` — existing code reading `parent_entity_id` keeps working unchanged, while new code gets the two relations disambiguated.
+
+The `checksum` field is not part of the PROV-O standard — it is Semantica's tamper-detection extension. Every entry's SHA-256 now also incorporates `previous_checksum` (the prior entry's checksum, by insertion order via `sequence_id`), chaining every entry to the one before it. `ProvenanceManager.verify_chain()` walks the full chain and reports any break — including a row that was hard-deleted from the underlying table, which a lone per-row checksum can't detect on its own.
+
+Note: the banking example above passes `agent_id="credit_data_service_v2"` to `track_entities_batch()` — this now actually populates the entry's `agent_id` field (previously a bug caused batch-level typed kwargs like `agent_id`/`entity_type`/`activity_id` to be silently absorbed into the opaque `metadata` blob instead).
+
+`export_prov()` mints entity/agent/activity URIs under `ProvenanceManager.DEFAULT_BASE_URI` (`https://semantica.dev/ns#` by default — the same namespace `RDFExporter`'s `NamespaceManager` uses for its `"semantica"` prefix, so KG-exported and PROV-exported URIs for the same `entity_id` co-resolve) unless overridden via `export_prov(base_uri=...)` or the CLI's `--base-uri` option.
 
 ## Related Guides
 
-- [Semantic Extraction](semantic-extraction) — the NER and relation extraction pipeline that auto-generates provenance entries for every extracted entity
-- [Conflict Resolution](conflict-resolution) — provenance property sources feed directly into conflict detection; every resolved value is traceable to its source
-- [Deduplication](deduplication) — merge operations are recorded in merge history; pair with provenance for a complete lineage from source to canonical entity
+- [Semantic Extraction](/guides/semantic-extraction) — the NER and relation extraction pipeline that auto-generates provenance entries for every extracted entity
+- [Conflict Resolution](/guides/conflict-resolution) — provenance property sources feed directly into conflict detection; every resolved value is traceable to its source
+- [Deduplication](/guides/deduplication) — merge operations are recorded in merge history; pair with provenance for a complete lineage from source to canonical entity
 - [Provenance Reference](../reference/provenance) — full storage backend API, `InMemoryStorage`, `SQLiteStorage`, and `ProvenanceEntry` schema

@@ -28,9 +28,10 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from ..utils.helpers import ensure_directory
+from ..utils.helpers import _require_mapping, ensure_directory, normalize_graph_payload
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+from .endpoint_names import SOURCE_ENDPOINT_NAMES, TARGET_ENDPOINT_NAMES, first_set_id
 
 
 class ArangoAQLExporter:
@@ -204,17 +205,19 @@ class ArangoAQLExporter:
                 self._generate_collection_creation(vertex_collection, edge_collection)
             )
 
-        # Extract entities and relationships
-        entities = knowledge_graph.get("entities", [])
-        relationships = knowledge_graph.get("relationships", [])
-        nodes = knowledge_graph.get("nodes", entities)
-        edges = knowledge_graph.get("edges", relationships)
+        # A non-mapping payload cannot reach normalize_graph_payload(): it
+        # raises ValidationError for that case, which would leave this
+        # exporter alone in raising a different exception type than the YAML
+        # and Neo4j exporters raise for the identical mistake.
+        _require_mapping(
+            knowledge_graph, ("entities", "relationships", "nodes", "edges")
+        )
 
-        # Use nodes/edges if entities/relationships are empty
-        if not entities and nodes:
-            entities = nodes
-        if not relationships and edges:
-            relationships = edges
+        # Accept either vocabulary; resolution is centralized so every
+        # exporter agrees on what a given payload means.
+        normalized = normalize_graph_payload(knowledge_graph)
+        entities = normalized["entities"]
+        relationships = normalized["relationships"]
 
         # Generate vertex INSERT statements
         vertex_statements = self._generate_vertex_inserts(entities, vertex_collection)
@@ -329,7 +332,9 @@ class ArangoAQLExporter:
         document = {}
 
         # Set _key from id or generate one
-        vertex_id = vertex.get("id") or vertex.get("entity_id") or f"vertex_{idx}"
+        vertex_id = first_set_id(vertex, ("id", "entity_id"))
+        if vertex_id is None:
+            vertex_id = f"vertex_{idx}"
         document["_key"] = self._sanitize_key(str(vertex_id))
 
         # Add original ID if different from _key
@@ -450,10 +455,10 @@ class ArangoAQLExporter:
             ArangoDB edge document dictionary, or None if source/target missing
         """
         # Extract source and target
-        source_id = edge.get("source") or edge.get("source_id")
-        target_id = edge.get("target") or edge.get("target_id")
+        source_id = first_set_id(edge, SOURCE_ENDPOINT_NAMES)
+        target_id = first_set_id(edge, TARGET_ENDPOINT_NAMES)
 
-        if not source_id or not target_id:
+        if source_id is None or target_id is None:
             self.logger.warning(
                 f"Skipping edge {idx}: missing source or target "
                 f"(source={source_id}, target={target_id})"
@@ -488,10 +493,8 @@ class ArangoAQLExporter:
                 "_to",
                 "id",
                 "relationship_id",
-                "source",
-                "source_id",
-                "target",
-                "target_id",
+                *SOURCE_ENDPOINT_NAMES,
+                *TARGET_ENDPOINT_NAMES,
                 "type",
                 "relationship_type",
             ]:
