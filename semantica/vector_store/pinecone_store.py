@@ -75,13 +75,13 @@ class PineconeClient:
 
         try:
             # Default to serverless spec if not provided
-            if spec is None:
+            if spec is None and ServerlessSpec is not None:
                 spec = ServerlessSpec(cloud="aws", region="us-east-1")
 
             # Map metric names
             metric_map = {
                 "cosine": "cosine",
-                "euclidean": "euclidean_distance",
+                "euclidean": "euclidean",
                 "dot": "dotproduct",
             }
             pinecone_metric = metric_map.get(metric.lower(), "cosine")
@@ -129,13 +129,30 @@ class PineconeClient:
         except Exception as e:
             raise ProcessingError(f"Failed to get index: {str(e)}")
 
+    def get_index_metric(self, index_name: str) -> Optional[str]:
+        """Read the metric from the control-plane index description."""
+        try:
+            description = self.client.describe_index(index_name)
+            metric = (
+                description.get("metric")
+                if isinstance(description, dict)
+                else description.metric
+            )
+            return metric if isinstance(metric, str) else None
+        except Exception as e:
+            self.logger.warning(
+                f"Could not determine index metric for '{index_name}': {e}"
+            )
+            return None
+
 
 class PineconeIndex:
     """Pinecone index wrapper."""
 
-    def __init__(self, index: Any):
+    def __init__(self, index: Any, metric: Optional[str] = None):
         """Initialize Pinecone index wrapper."""
         self.index = index
+        self.metric = metric
         self.logger = get_logger("pinecone_index")
 
     def upsert_vectors(
@@ -191,11 +208,19 @@ class PineconeIndex:
 
             results = []
             for match in response.matches:
+                score = float(match.score)
+                if self.metric == "euclidean":
+                    similarity = 1.0 / (1.0 + max(0.0, score))
+                else:
+                    # Preserve the existing normalization for cosine and dotproduct.
+                    similarity = (score / (1.0 + abs(score)) + 1.0) / 2.0
                 results.append(
                     {
                         "id": match.id,
-                        "score": match.score,
+                        "score": similarity,
                         "metadata": match.metadata or {},
+                        "vector": None,
+                        "distance": None,
                     }
                 )
 
@@ -288,6 +313,44 @@ class PineconeSearch:
         )
 
 
+def _pinecone_listed_ids(response: Any) -> List[str]:
+    """Extract vector IDs from a list_paginated() response.
+
+    Accepts record objects, bare id strings and dicts, since what listing
+    returns has changed across pinecone SDK major versions.
+    """
+    records = getattr(response, "vectors", None)
+    if records is None and isinstance(response, dict):
+        records = response.get("vectors")
+
+    ids: List[str] = []
+    for record in records or []:
+        if isinstance(record, str):
+            ids.append(record)
+        elif isinstance(record, dict):
+            if record.get("id") is not None:
+                ids.append(record["id"])
+        else:
+            record_id = getattr(record, "id", None)
+            if record_id is not None:
+                ids.append(record_id)
+    return ids
+
+
+def _pinecone_next_token(response: Any) -> Optional[str]:
+    """Return the continuation token, or None when the listing is exhausted."""
+    pagination = getattr(response, "pagination", None)
+    if pagination is None and isinstance(response, dict):
+        pagination = response.get("pagination")
+    if pagination is None:
+        return None
+
+    token = getattr(pagination, "next", None)
+    if token is None and isinstance(pagination, dict):
+        token = pagination.get("next")
+    return token or None
+
+
 class PineconeStore:
     """
     Pinecone store for vector storage and similarity search.
@@ -316,6 +379,7 @@ class PineconeStore:
 
         self.api_key = api_key or config.get("api_key")
         self.environment = environment or config.get("environment")
+        self.dimension: Optional[int] = config.get("dimension")
 
         self.client: Optional[PineconeClient] = None
         self.index: Optional[PineconeIndex] = None
@@ -324,7 +388,7 @@ class PineconeStore:
         # Check Pinecone availability
         if not PINECONE_AVAILABLE:
             self.logger.warning(
-                "Pinecone not available. Install with: pip install pinecone-client"
+                "Pinecone not available. Install with: pip install pinecone>=3.0.0 or pip install semantica[vectorstore-pinecone]"
             )
 
     def connect(self, **kwargs) -> bool:
@@ -339,7 +403,7 @@ class PineconeStore:
         """
         if not PINECONE_AVAILABLE:
             raise ProcessingError(
-                "Pinecone is not available. Install it with: pip install pinecone-client"
+                "Pinecone is not available. Install it with: pip install pinecone>=3.0.0 or pip install semantica[vectorstore-pinecone]"
             )
 
         api_key = kwargs.get("api_key") or self.api_key
@@ -384,15 +448,18 @@ class PineconeStore:
 
         try:
             # Create index spec if not provided
-            if spec is None:
+            if spec is None and ServerlessSpec is not None:
                 spec = ServerlessSpec(cloud="aws", region="us-east-1")
 
             self.client.create_index(index_name, dimension, metric, spec, **kwargs)
 
             # Get the index
             pinecone_index = self.client.get_index(index_name)
-            self.index = PineconeIndex(pinecone_index)
+            self.index = PineconeIndex(
+                pinecone_index, metric=self.client.get_index_metric(index_name)
+            )
             self.search_engine = PineconeSearch(self.index)
+            self.dimension = dimension
 
             self.logger.info(f"Created Pinecone index: {index_name}")
             return self.index
@@ -418,8 +485,17 @@ class PineconeStore:
 
         try:
             pinecone_index = self.client.get_index(index_name)
-            self.index = PineconeIndex(pinecone_index)
+            self.index = PineconeIndex(
+                pinecone_index, metric=self.client.get_index_metric(index_name)
+            )
             self.search_engine = PineconeSearch(self.index)
+            if self.dimension is None:
+                try:
+                    stats = self.index.describe_index_stats()
+                    if stats and isinstance(stats, dict) and stats.get("dimension"):
+                        self.dimension = int(stats["dimension"])
+                except Exception as e:
+                    self.logger.warning(f"Could not determine index dimension for '{index_name}': {e}")
             return self.index
         except Exception as e:
             raise ProcessingError(f"Failed to get index: {str(e)}")
@@ -505,6 +581,9 @@ class PineconeStore:
                 else:
                     vector_list.append(list(vector))
 
+            if self.dimension is None and vector_list:
+                self.dimension = len(vector_list[0])
+
             self.progress_tracker.update_tracking(
                 tracking_id, message="Upserting vectors to index..."
             )
@@ -571,6 +650,9 @@ class PineconeStore:
             else:
                 query_vector = list(query_vector)
 
+            if self.dimension is None and query_vector:
+                self.dimension = len(query_vector)
+
             results = self.search_engine.similarity_search(
                 np.array(query_vector), k, filter, namespace, **options
             )
@@ -607,6 +689,192 @@ class PineconeStore:
             )
 
         return self.index.delete_vectors(vector_ids, namespace, **options)
+
+    def get_vector(self, vector_id: str) -> Optional[np.ndarray]:
+        """Get vector by ID."""
+        try:
+            res = self.fetch_vectors([vector_id])
+            if "vectors" in res and vector_id in res["vectors"]:
+                return np.array(res["vectors"][vector_id]["values"])
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to get vector {vector_id}: {e}")
+            return None
+
+    def get_metadata(self, vector_id: str) -> Optional[Dict[str, Any]]:
+        """Get metadata by ID."""
+        try:
+            res = self.fetch_vectors([vector_id])
+            if "vectors" in res and vector_id in res["vectors"]:
+                return res["vectors"][vector_id].get("metadata", {})
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to get metadata for {vector_id}: {e}")
+            return None
+
+    def filter_by_metadata(
+        self, filters: Dict[str, Any], limit: int = 10, namespace: str = ""
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter vectors by metadata using Pinecone metadata filters.
+
+        Args:
+            filters: Metadata filter criteria
+            limit: Maximum number of results
+            namespace: Namespace to search in
+
+        Returns:
+            List of matching result dicts with 'id', 'metadata', and 'vector'
+        """
+        if self.index is None or not PINECONE_AVAILABLE:
+            return []
+
+        dimension = self.dimension
+        if dimension is None:
+            try:
+                stats = self.index.describe_index_stats()
+                if stats and isinstance(stats, dict) and stats.get("dimension"):
+                    dimension = int(stats["dimension"])
+                    self.dimension = dimension
+            except Exception:
+                pass
+
+        if not dimension:
+            raise ProcessingError(
+                "Index dimension is unknown. Please specify 'dimension' when initializing PineconeStore "
+                "or call create_index()/get_index() first."
+            )
+
+        pinecone_filter = {}
+        if filters:
+            for key, value in filters.items():
+                if isinstance(value, dict):
+                    cond = {}
+                    if "min" in value and value["min"] is not None:
+                        cond["$gte"] = value["min"]
+                    if "max" in value and value["max"] is not None:
+                        cond["$lte"] = value["max"]
+                    if cond:
+                        pinecone_filter[key] = cond
+                elif isinstance(value, list):
+                    pinecone_filter[key] = {"$in": value}
+                else:
+                    pinecone_filter[key] = value
+
+        # A literal zero vector is rejected by Pinecone for cosine-metric indexes
+        # ("Query vector must not be the zero vector"). Use a unit vector instead so
+        # this works regardless of the index's distance metric; since this call only
+        # cares about which vectors match `filter`, not similarity ranking, any
+        # fixed non-zero query vector is an equally valid probe.
+        dummy_vector = [1.0 / (dimension ** 0.5)] * dimension
+
+        try:
+            response = self.index.index.query(
+                vector=dummy_vector,
+                top_k=limit,
+                filter=pinecone_filter if pinecone_filter else None,
+                namespace=namespace,
+                include_metadata=True,
+                include_values=True,
+            )
+            results = []
+            for match in response.matches:
+                results.append(
+                    {
+                        "id": match.id,
+                        "metadata": match.metadata or {},
+                        "vector": np.array(match.values) if match.values else None,
+                    }
+                )
+            return results
+        except Exception as e:
+            self.logger.warning(f"Failed to filter Pinecone vectors by metadata: {e}")
+            return []
+
+    def iter_all(self, batch_size: int = 500, namespace: str = ""):
+        """
+        Iterate over every stored vector by listing IDs then fetching them.
+
+        Paginates with an opaque continuation token, which is why this exists
+        instead of scan_vectors(offset, limit): the token for page N cannot be
+        constructed without walking there.
+
+        Needs two calls per page, unlike the other backends, because listing
+        returns IDs only. Both calls are namespace scoped and must agree, and
+        listing covers one namespace rather than the whole index.
+
+        Args:
+            batch_size: IDs to request per list_paginated() call
+            namespace: Namespace to enumerate (default: the default namespace)
+
+        Yields:
+            Result dicts with 'id', 'metadata', and 'vector', in listing order
+
+        Raises:
+            ProcessingError: If the index is not initialized, if the installed
+                SDK does not expose list_paginated(), or if the listing stops
+                advancing.
+        """
+        if self.index is None or not PINECONE_AVAILABLE:
+            raise ProcessingError(
+                "Index not initialized. Call create_index() or get_index() first."
+            )
+
+        # list_paginated() rather than list(): list() is an auto-paging
+        # iterator in current SDKs but reads as plain id lists in older
+        # examples. Threading the token explicitly is version-agnostic.
+        list_paginated = getattr(self.index.index, "list_paginated", None)
+        if not callable(list_paginated):
+            raise ProcessingError(
+                "This pinecone SDK version does not expose Index.list_paginated(), "
+                "which full enumeration requires."
+            )
+
+        token = None
+        while True:
+            kwargs: Dict[str, Any] = {"limit": batch_size, "namespace": namespace}
+            if token is not None:
+                kwargs["pagination_token"] = token
+
+            response = list_paginated(**kwargs)
+            vector_ids = _pinecone_listed_ids(response)
+
+            # A page listing zero ids is not necessarily exhaustion: Pinecone's
+            # contract is that a scan ends only when there's no pagination
+            # token, and a page can legitimately come back empty while
+            # pagination.next is still set (sparse/filtered namespaces,
+            # eventual-consistency windows on serverless indexes). Skip the
+            # fetch (nothing to hydrate) but still fall through to the token
+            # check below instead of returning early, or a gap like that
+            # silently truncates the scan with no error.
+            if vector_ids:
+                fetched = self.index.fetch_vectors(vector_ids, namespace=namespace)
+                vectors = fetched.get("vectors") or {}
+
+                for vector_id in vector_ids:
+                    entry = vectors.get(vector_id)
+                    if entry is None:
+                        # fetch() omits ids it cannot find: deleted since listing.
+                        continue
+                    values = entry.get("values")
+                    yield {
+                        "id": vector_id,
+                        "metadata": entry.get("metadata") or {},
+                        "vector": np.array(values) if values is not None else None,
+                    }
+
+            next_token = _pinecone_next_token(response)
+            if not next_token:
+                return
+            if next_token == token:
+                # Distinct from exhaustion above: a partial scan here would be
+                # indistinguishable from a complete one.
+                raise ProcessingError(
+                    "Pinecone returned the same pagination token twice, so the "
+                    "listing is not advancing. Refusing to return a truncated "
+                    "scan."
+                )
+            token = next_token
 
     def fetch_vectors(
         self, vector_ids: List[str], namespace: str = "", **options

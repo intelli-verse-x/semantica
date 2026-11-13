@@ -17,10 +17,14 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { ErrorBoundary } from './ErrorBoundary';
+import { ExploreWorkspaceTabs, type ExploreView } from './ExploreWorkspaceTabs';
+import { fetchAgentMemoryAvailability } from './explorerCapabilities';
+import { hasOntologyUrlState } from './workspaces/OntologyWorkspace/ontologyUrlState';
 
 const DecisionWorkspace = lazy(() => import('./workspaces/DecisionWorkspace/DecisionWorkspace').then((module) => ({ default: module.DecisionWorkspace })));
 const DiffMergeWorkspace = lazy(() => import('./workspaces/DiffMergeWorkspace/DiffMergeWorkspace').then((module) => ({ default: module.DiffMergeWorkspace })));
 const GraphWorkspace = lazy(() => import('./workspaces/GraphWorkspace/GraphWorkspace').then((module) => ({ default: module.GraphWorkspace })));
+const MemoryWorkspace = lazy(() => import('./workspaces/MemoryWorkspace').then((module) => ({ default: module.MemoryWorkspace })));
 const ImportExportWorkspace = lazy(() => import('./workspaces/ImportExportWorkspace/ImportExportWorkspace').then((module) => ({ default: module.ImportExportWorkspace })));
 const LineageDiagram = lazy(() => import('./workspaces/LineageWorkspace/LineageDiagram').then((module) => ({ default: module.LineageDiagram })));
 const ReasoningWorkspace = lazy(() => import('./workspaces/ReasoningWorkspace').then((module) => ({ default: module.ReasoningWorkspace })));
@@ -33,7 +37,6 @@ const OntologySummaryTab = lazy(() => import('./workspaces/ManageWorkspace/Ontol
 const OntologyWorkspace = lazy(() => import('./workspaces/OntologyWorkspace').then((module) => ({ default: module.OntologyWorkspace })));
 
 type WorkspaceId = 'welcome' | 'explore' | 'analyze' | 'decisions' | 'enrich' | 'manage' | 'ontology-hub';
-type ExploreView = 'graph' | 'vocabulary';
 type AnalyzeView = 'sparql' | 'reasoning';
 type EnrichView = 'import' | 'merge' | 'registry' | 'resolve';
 type ManageView = 'lineage' | 'kg-overview' | 'ontology';
@@ -67,6 +70,14 @@ type GraphStatsPayload = {
   edges?: number;
 };
 
+type ConnectionStatus = 'checking' | 'online' | 'offline';
+
+const CONNECTION_STATUS_LABEL: Record<ConnectionStatus, string> = {
+  checking: 'Connecting…',
+  online: 'System Online',
+  offline: 'Backend Unreachable',
+};
+
 const queryClient = new QueryClient();
 
 const PREVIEW_DOTS = Array.from({ length: 42 }, (_, i) => ({
@@ -84,6 +95,10 @@ const navItems: NavItem[] = [
   { id: 'manage', label: 'Manage', hint: 'Lineage and governance tooling', icon: Settings2 },
   { id: 'ontology-hub', label: 'Ontology Hub', hint: 'Schema governance, registry, and vocabulary management', icon: GitMerge },
 ];
+
+function readInitialWorkspace(): WorkspaceId {
+  return hasOntologyUrlState() ? 'ontology-hub' : 'welcome';
+}
 
 const shellStyles = `
   :root {
@@ -719,19 +734,34 @@ const shellStyles = `
     align-items: center;
     gap: 10px;
     margin-bottom: 24px;
+    --status-color: #4cc38a;
+    --status-shadow-a: 0 0 0 3px rgba(76, 195, 138, 0.22), 0 0 12px rgba(76, 195, 138, 0.5);
+    --status-shadow-b: 0 0 0 5px rgba(76, 195, 138, 0.1), 0 0 20px rgba(76, 195, 138, 0.35);
+  }
+
+  .landing-status-bar[data-status='checking'] {
+    --status-color: #f2b66d;
+    --status-shadow-a: 0 0 0 3px rgba(242, 182, 109, 0.22), 0 0 12px rgba(242, 182, 109, 0.5);
+    --status-shadow-b: 0 0 0 5px rgba(242, 182, 109, 0.1), 0 0 20px rgba(242, 182, 109, 0.35);
+  }
+
+  .landing-status-bar[data-status='offline'] {
+    --status-color: #ff7b72;
+    --status-shadow-a: 0 0 0 3px rgba(255, 123, 114, 0.22), 0 0 12px rgba(255, 123, 114, 0.5);
+    --status-shadow-b: 0 0 0 5px rgba(255, 123, 114, 0.1), 0 0 20px rgba(255, 123, 114, 0.35);
   }
 
   .landing-status-dot {
     width: 8px;
     height: 8px;
     border-radius: 999px;
-    background: #4cc38a;
-    box-shadow: 0 0 0 3px rgba(76, 195, 138, 0.22), 0 0 12px rgba(76, 195, 138, 0.5);
+    background: var(--status-color);
+    box-shadow: var(--status-shadow-a);
     animation: landing-pulse 2.4s ease-in-out infinite;
   }
 
   .landing-status-text {
-    color: #4cc38a;
+    color: var(--status-color);
     font: 700 11px/1 "JetBrains Mono", monospace;
     letter-spacing: 0.1em;
     text-transform: uppercase;
@@ -1323,8 +1353,8 @@ const shellStyles = `
   }
 
   @keyframes landing-pulse {
-    0%, 100% { box-shadow: 0 0 0 3px rgba(76, 195, 138, 0.22), 0 0 12px rgba(76, 195, 138, 0.5); }
-    50% { box-shadow: 0 0 0 5px rgba(76, 195, 138, 0.1), 0 0 20px rgba(76, 195, 138, 0.35); }
+    0%, 100% { box-shadow: var(--status-shadow-a); }
+    50% { box-shadow: var(--status-shadow-b); }
   }
 
   .workspace-loading {
@@ -1494,10 +1524,10 @@ function WelcomeScreen({
   onOpenDecisions: () => void;
   onOpenManage: () => void;
 }) {
-  const [stats, setStats] = useState<{ nodes: number | null; edges: number | null; ready: boolean }>({
+  const [stats, setStats] = useState<{ nodes: number | null; edges: number | null; status: ConnectionStatus }>({
     nodes: null,
     edges: null,
-    ready: false,
+    status: 'checking',
   });
 
   useEffect(() => {
@@ -1507,31 +1537,32 @@ function WelcomeScreen({
       .then((response) => (response.ok ? response.json() as Promise<GraphStatsPayload> : null))
       .then((payload) => {
         if (!payload) {
-          setStats((current) => ({ ...current, ready: false }));
+          setStats((current) => ({ ...current, status: 'offline' }));
           return;
         }
 
         setStats({
           nodes: getNumberStat(payload, ['node_count', 'nodeCount', 'nodes']),
           edges: getNumberStat(payload, ['edge_count', 'edgeCount', 'edges']),
-          ready: true,
+          status: 'online',
         });
       })
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === 'AbortError') {
           return;
         }
-        setStats((current) => ({ ...current, ready: false }));
+        setStats((current) => ({ ...current, status: 'offline' }));
       });
 
     return () => controller.abort();
   }, []);
 
+  const isOnline = stats.status === 'online';
   const metrics: LandingMetric[] = [
     { label: 'Knowledge nodes', value: formatMetric(stats.nodes, 'Live'), tone: 'cyan' },
     { label: 'Relationships mapped', value: formatMetric(stats.edges, 'Ready'), tone: 'mint' },
     { label: 'Graph modes', value: '3', tone: 'amber' },
-    { label: stats.ready ? 'Dataset online' : 'Ready to explore', value: stats.ready ? 'Active' : 'Standby', tone: 'rose' },
+    { label: isOnline ? 'Dataset online' : 'Ready to explore', value: isOnline ? 'Active' : 'Standby', tone: 'rose' },
   ];
 
   const secondaryLaunchers: LandingAction[] = [
@@ -1574,9 +1605,9 @@ function WelcomeScreen({
         {/* ── Hero ── */}
         <section className="landing-hero">
           <div className="landing-copy">
-            <div className="landing-status-bar">
+            <div className="landing-status-bar" data-status={stats.status}>
               <div className="landing-status-dot" />
-              <span className="landing-status-text">System Online</span>
+              <span className="landing-status-text">{CONNECTION_STATUS_LABEL[stats.status]}</span>
               <div className="landing-status-divider" />
               <span className="landing-status-version">Semantica v2 · Semantic Intelligence</span>
             </div>
@@ -1749,12 +1780,43 @@ function WelcomeScreen({
 }
 
 export default function App() {
-  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId>('welcome');
+  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId>(readInitialWorkspace);
   const [exploreView, setExploreView] = useState<ExploreView>('graph');
   const [analyzeView, setAnalyzeView] = useState<AnalyzeView>('reasoning');
   const [enrichView, setEnrichView] = useState<EnrichView>('import');
   const [manageView, setManageView] = useState<ManageView>('lineage');
   const [graphFocusRequest, setGraphFocusRequest] = useState<{ nodeId: string; token: number } | null>(null);
+  const [exploreDraftDirty, setExploreDraftDirty] = useState(false);
+  const [agentMemoryAvailable, setAgentMemoryAvailable] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void fetchAgentMemoryAvailability().then((available) => {
+      if (active) setAgentMemoryAvailable(available);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const confirmDiscardExploreDraft = () => (
+    !exploreDraftDirty
+    || window.confirm("Discard the unapplied Markdown draft and leave this resource?")
+  );
+
+  const switchExploreView = (nextView: ExploreView) => {
+    if (nextView === exploreView) return;
+    if (!confirmDiscardExploreDraft()) return;
+    setExploreDraftDirty(false);
+    setExploreView(nextView);
+  };
+
+  const switchWorkspace = (nextWorkspace: WorkspaceId) => {
+    if (nextWorkspace === activeWorkspace) return;
+    if (activeWorkspace === "explore" && !confirmDiscardExploreDraft()) return;
+    setExploreDraftDirty(false);
+    setActiveWorkspace(nextWorkspace);
+  };
 
 
   const renderWorkspace = () => {
@@ -1787,18 +1849,15 @@ export default function App() {
       return (
         <WorkspaceShell
           title="Explore"
-          subtitle={exploreView === 'graph' ? undefined : "Browse the graph and switch views without leaving the workspace."}
-          kicker={exploreView === 'graph' ? 'Graph Studio' : 'Vocabulary Browser'}
+          subtitle={exploreView === 'graph' ? undefined : exploreView === 'memories' ? "Browse and edit canonical AgentMemory documents." : "Browse the graph and switch views without leaving the workspace."}
+          kicker={exploreView === 'graph' ? 'Graph Studio' : exploreView === 'memories' ? 'Memory Browser' : 'Vocabulary Browser'}
           compact
           tabs={
-            <>
-              <button className="workspace-tab" data-active={exploreView === 'graph'} onClick={() => setExploreView('graph')}>
-                Semantica Explorer
-              </button>
-              <button className="workspace-tab" data-active={exploreView === 'vocabulary'} onClick={() => setExploreView('vocabulary')}>
-                Vocabulary Browser
-              </button>
-            </>
+            <ExploreWorkspaceTabs
+              activeView={exploreView}
+              agentMemoryAvailable={agentMemoryAvailable}
+              onSelect={switchExploreView}
+            />
           }
         >
           <ErrorBoundary key={`explore-${exploreView}`}>
@@ -1807,8 +1866,9 @@ export default function App() {
                 <GraphWorkspace
                   externalFocusNodeId={graphFocusRequest?.nodeId}
                   externalFocusToken={graphFocusRequest?.token}
+                  onDirtyChange={setExploreDraftDirty}
                 />
-              ) : <VocabularyWorkspace />}
+              ) : exploreView === 'memories' ? <MemoryWorkspace onDirtyChange={setExploreDraftDirty} /> : <VocabularyWorkspace />}
             </Suspense>
           </ErrorBoundary>
         </WorkspaceShell>
@@ -1953,13 +2013,13 @@ export default function App() {
       <style>{shellStyles}</style>
       <div className="app-shell">
         <aside className="app-rail">
-          <button className="brand-pill" title="Semantica Knowledge Explorer" onClick={() => setActiveWorkspace('welcome')} style={{ cursor: 'pointer', border: '1px solid rgba(127,208,255,0.18)' }}>SKE</button>
+          <button className="brand-pill" title="Semantica Knowledge Explorer" onClick={() => switchWorkspace('welcome')} style={{ cursor: 'pointer', border: '1px solid rgba(127,208,255,0.18)' }}>SKE</button>
           {navItems.map(({ id, label, hint, icon: Icon }) => (
             <button
               key={id}
               className="nav-button"
               data-active={activeWorkspace === id}
-              onClick={() => setActiveWorkspace(id)}
+              onClick={() => switchWorkspace(id)}
               title={hint}
             >
               <Icon size={20} />

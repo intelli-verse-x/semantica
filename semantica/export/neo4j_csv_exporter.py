@@ -32,14 +32,16 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
 from ..utils.exceptions import ProcessingError, ValidationError
-from ..utils.helpers import ensure_directory
+from ..utils.helpers import ensure_directory, normalize_graph_payload
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+from .endpoint_names import first_set_id
 
 
 class Neo4jCSVExporter:
@@ -87,6 +89,7 @@ class Neo4jCSVExporter:
         "subject",
         "start",
         "start_id",
+        "start_node_id",
     )
     _TARGET_KEYS = (
         "target",
@@ -96,6 +99,7 @@ class Neo4jCSVExporter:
         "object",
         "end",
         "end_id",
+        "end_node_id",
     )
     _REL_TYPE_KEYS = (
         "type",
@@ -173,6 +177,19 @@ class Neo4jCSVExporter:
 
         Returns:
             Mapping with ``"nodes"`` and ``"relationships"`` output paths.
+
+        Raises:
+            ValidationError: if a mapping payload carries no recognized graph
+                key, resolves to nothing while an unread key still holds
+                records, or holds something other than records under one --
+                see
+                :func:`~semantica.utils.helpers.normalize_graph_payload`.
+                Each would otherwise be written out as header-only CSVs
+                indistinguishable from a genuinely empty graph. The payload is
+                normalized before any file is opened, so a rejected export
+                writes nothing.
+            ProcessingError: if a non-mapping payload exposes none of the
+                graph attributes.
         """
         output_dir = Path(output_dir)
         ensure_directory(output_dir)
@@ -494,9 +511,19 @@ class Neo4jCSVExporter:
         return prepared
 
     def _normalize_graph(self, graph: Any) -> Dict[str, List[Dict[str, Any]]]:
-        if isinstance(graph, dict):
-            nodes = graph.get("nodes") or graph.get("entities") or []
-            relationships = graph.get("edges") or graph.get("relationships") or []
+        if isinstance(graph, Mapping):
+            # Mapping payloads go through the shared resolver on its default
+            # terms, so this backend cannot drift from the others: an
+            # unrecognized mapping raises here rather than writing header-only
+            # CSVs that read as a successful export of an empty graph. Checked
+            # against Mapping rather than dict, so a non-dict Mapping (a
+            # MappingProxyType, a ChainMap) takes this path too, instead of
+            # falling through to the attribute branch below and being rejected
+            # as an unrecognized object -- the LPG, Arango, and YAML exporters
+            # already accept such payloads via the same resolver.
+            resolved = normalize_graph_payload(graph)
+            nodes = resolved["entities"]
+            relationships = resolved["relationships"]
         else:
             nodes = getattr(graph, "nodes", None)
             if nodes is None:
@@ -591,8 +618,8 @@ class Neo4jCSVExporter:
         relationship_infos = []
 
         for index, relationship in enumerate(relationships):
-            raw_start = self._first_value(relationship, self._SOURCE_KEYS)
-            raw_end = self._first_value(relationship, self._TARGET_KEYS)
+            raw_start = first_set_id(relationship, self._SOURCE_KEYS)
+            raw_end = first_set_id(relationship, self._TARGET_KEYS)
             if raw_start is None or raw_end is None:
                 raise ValidationError(
                     f"Relationship {index} is missing source or target",

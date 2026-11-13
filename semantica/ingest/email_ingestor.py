@@ -30,6 +30,7 @@ License: MIT
 """
 
 import email
+import email.message
 import imaplib
 import poplib
 import tempfile
@@ -40,11 +41,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-from bs4 import BeautifulSoup
 
 from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+
+# beautifulsoup4 ships in the optional `documents` extra, so guard it the way
+# the sibling ingestors guard theirs (`git` in repo_ingestor, `lxml` in
+# xml_ingestor): importing this module must not require the extra.
+try:
+    from bs4 import BeautifulSoup
+except (ImportError, OSError):
+    BeautifulSoup = None
 
 
 @dataclass
@@ -180,7 +188,7 @@ class AttachmentProcessor:
 
         This method attempts to extract text content from various document
         types. Currently supports plain text files. PDF and Word document
-        extraction would require additional libraries (PyPDF2/pdfplumber for
+        extraction would require additional libraries (pdfplumber for
         PDF, python-docx for Word).
 
         Args:
@@ -193,9 +201,9 @@ class AttachmentProcessor:
         """
         try:
             if file_type == "application/pdf":
-                # PDF text extraction would require PyPDF2 or pdfplumber
+                # PDF text extraction would require pdfplumber
                 self.logger.debug(
-                    "PDF text extraction not implemented (requires PyPDF2/pdfplumber)"
+                    "PDF text extraction not implemented (requires pdfplumber)"
                 )
                 return None
             elif file_type in [
@@ -382,6 +390,14 @@ class EmailParser:
 
         # Extract from HTML if available
         if email_content.strip().startswith("<"):
+            # Checked before the try: the `except Exception: pass` below would
+            # suppress this and fall back to the regex scan, which misses
+            # relative URLs and href-only links, with no hint to the caller.
+            if BeautifulSoup is None:
+                raise ProcessingError(
+                    "HTML parsing requires 'beautifulsoup4'. "
+                    "Install it with: pip install 'semantica[documents]'"
+                )
             try:
                 soup = BeautifulSoup(email_content, "html.parser")
                 for link_tag in soup.find_all("a", href=True):

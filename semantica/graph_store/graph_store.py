@@ -38,6 +38,7 @@ from ..utils.exceptions import ValidationError
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
 from .config import graph_store_config
+from .query_sanitize import sanitize_identifier
 
 
 class NodeManager:
@@ -294,7 +295,7 @@ class QueryEngine:
         import hashlib
 
         key_str = f"{query}:{str(parameters)}"
-        return hashlib.md5(key_str.encode()).hexdigest()
+        return hashlib.md5(key_str.encode()).hexdigest()  # nosec B324 - cache key, not security-sensitive
 
     def clear_cache(self) -> None:
         """Clear query cache."""
@@ -393,12 +394,12 @@ class GraphAnalytics:
         """
         # Build query based on direction
         if labels:
-            label_str = ":".join(labels)
+            label_str = ":".join(sanitize_identifier(l, "label") for l in labels)
             match = f"MATCH (n:{label_str})"
         else:
             match = "MATCH (n)"
 
-        type_filter = f":{rel_type}" if rel_type else ""
+        type_filter = f":{sanitize_identifier(rel_type, 'relationship type')}" if rel_type else ""
 
         if direction == "out":
             query = f"""
@@ -432,7 +433,7 @@ class GraphAnalytics:
         self,
         labels: Optional[List[str]] = None,
         **options,
-    ) -> Dict[str, Any]:
+    ) -> List[Dict[str, Any]]:
         """
         Find connected components in the graph.
 
@@ -444,7 +445,8 @@ class GraphAnalytics:
             **options: Additional options
 
         Returns:
-            Component information
+            List of component dicts, each with "component" (id) and
+            "nodes" (list of node ids).
         """
         backend_type = type(self.backend).__name__
 
@@ -459,8 +461,12 @@ class GraphAnalytics:
             """
             params = {"label": labels[0] if labels else "*"}
             result = self.backend.execute_query(query, params)
+            # execute_query returns a {"success", "records", "keys",
+            # "metadata"} envelope — iterate its records, not the envelope
+            # itself (same read as degree_centrality above).
             return [
-                {"component": r["componentId"], "nodes": r["nodes"]} for r in result
+                {"component": r["componentId"], "nodes": r["nodes"]}
+                for r in result.get("records", [])
             ]
 
         elif "NetworkX" in backend_type:
@@ -555,6 +561,13 @@ class GraphStore:
         )
         self.config = config
 
+        # Application-id -> backend-internal-id map for nodes added through
+        # the compatibility layer (#1136). add_nodes()/create_node() record
+        # the internal ids the backend returns; create_relationship()
+        # resolves known application ids through it so string ids stop
+        # mismatching backends that match on internal ids (Neo4j id(n)).
+        self._app_node_id_map: Dict[Any, Any] = {}
+
         # Initialize store backend
         self._store_backend = None
         self._manager = None
@@ -629,7 +642,9 @@ class GraphStore:
         **options,
     ) -> Dict[str, Any]:
         """Create a node."""
-        return self._manager.nodes.create(labels, properties, **options)
+        created = self._manager.nodes.create(labels, properties, **options)
+        self._record_app_node_id(created)
+        return created
 
     def create_nodes(
         self,
@@ -687,9 +702,25 @@ class GraphStore:
         properties: Optional[Dict[str, Any]] = None,
         **options,
     ) -> Dict[str, Any]:
-        """Create a relationship."""
+        """Create a relationship.
+
+        Node ids added through the compatibility layer are application-level
+        strings, while backends such as Neo4j match on internal integer ids
+        (#1136). Known application ids are resolved to the internal ids the
+        backend returned at creation time; unknown ids pass through
+        unchanged, so direct internal-id callers keep working. Only string
+        application ids participate: internal ids are commonly integers, so
+        recording or resolving an integer key could remap a caller-supplied
+        internal id to a different node.
+        """
         return self._manager.relationships.create(
-            start_node_id, end_node_id, rel_type, properties, **options
+            self._app_node_id_map.get(start_node_id, start_node_id)
+            if isinstance(start_node_id, str) else start_node_id,
+            self._app_node_id_map.get(end_node_id, end_node_id)
+            if isinstance(end_node_id, str) else end_node_id,
+            rel_type,
+            properties,
+            **options,
         )
 
     def get_relationships(
@@ -756,7 +787,7 @@ class GraphStore:
             **options: Additional options
         """
         # Support 'hops' as alias for 'depth' for ContextRetriever compatibility
-        actual_depth = options.get("hops", depth)
+        actual_depth = int(options.get("hops", depth))
         return self._manager.analytics.get_neighbors(
             node_id, rel_type, direction, actual_depth, **options
         )
@@ -792,6 +823,24 @@ class GraphStore:
     ) -> bool:
         """Create an index."""
         return self._manager.create_index(label, property_name, index_type, **options)
+
+    def _record_app_node_id(self, created: Optional[Dict[str, Any]]) -> None:
+        """Record the application-id -> internal-id pair of a created node.
+
+        Backends return their own internal id alongside the stored properties;
+        when the caller supplied an application id it is preserved in
+        ``properties["id"]`` by the compatibility layer, which makes the pair
+        recoverable (#1136). Only STRING application ids are recorded:
+        internal ids are commonly integers, and an integer application id
+        would collide with (and silently remap) a caller-supplied internal id
+        of the same value in ``create_relationship``.
+        """
+        if not isinstance(created, dict):
+            return
+        app_id = (created.get("properties") or {}).get("id")
+        internal_id = created.get("id")
+        if isinstance(app_id, str) and internal_id is not None:
+            self._app_node_id_map[app_id] = internal_id
 
     # Compatibility with AgentMemory / ContextGraph interface
     def add_nodes(self, nodes: List[Dict[str, Any]], **options) -> int:
@@ -852,11 +901,20 @@ class GraphStore:
         # and properties.
 
         result = self.create_nodes(graph_nodes, **options)
+        # Keep the application-id -> internal-id pairs instead of discarding
+        # them, so add_edges()/create_relationship() can resolve the string
+        # ids callers actually use (#1136).
+        for created in result:
+            self._record_app_node_id(created)
         return len(result)
 
     def add_edges(self, edges: List[Dict[str, Any]], **options) -> int:
         """
         Add edges (Compatibility method).
+
+        ``source_id``/``target_id`` are application-level string ids; they are
+        resolved to the backend's internal ids via the map ``add_nodes``
+        populated when the nodes were created (#1136).
 
         Args:
             edges: List of edge dictionaries
@@ -1056,7 +1114,7 @@ class GraphStore:
             if not entity_id and entity_text:
                 import hashlib
 
-                entity_hash = hashlib.md5(
+                entity_hash = hashlib.md5(  # nosec B324 - deterministic entity ID, not security-sensitive
                     f"{entity_text}_{entity_type}".encode()
                 ).hexdigest()[:12]
                 entity_id = f"{entity_type.lower()}_{entity_hash}"

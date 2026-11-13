@@ -41,16 +41,25 @@ Author: Semantica Contributors
 License: MIT
 """
 
-from .schemas import ProvenanceEntry, SourceReference
+from .schemas import (
+    ProvenanceEntry,
+    SourceReference,
+    AgentRecord,
+    ActivityRecord,
+    Invalidation,
+)
 from .storage import ProvenanceStorage, InMemoryStorage, SQLiteStorage
-from .manager import ProvenanceManager, default_storage_path
+from .manager import ProvenanceManager, default_storage_path, storage_path_from_env
 from .integrity import compute_checksum, verify_checksum
 
 __all__ = [
     # Core schemas
     "ProvenanceEntry",
     "SourceReference",
-    
+    "AgentRecord",
+    "ActivityRecord",
+    "Invalidation",
+
     # Storage backends
     "ProvenanceStorage",
     "InMemoryStorage",
@@ -59,6 +68,7 @@ __all__ = [
     # Manager
     "ProvenanceManager",
     "default_storage_path",
+    "storage_path_from_env",
     
     # Utilities
     "compute_checksum",

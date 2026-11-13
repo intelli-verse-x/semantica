@@ -63,6 +63,7 @@ except (ImportError, OSError):
     except (ImportError, OSError):
         PSYCOPG2_AVAILABLE = False
         psycopg2 = None
+        psycopg_sql = None
 
 # Optional pgvector import
 try:
@@ -445,6 +446,8 @@ class PgVectorStore:
                         "id": vec_id,
                         "score": similarity,
                         "metadata": meta if isinstance(meta, dict) else json.loads(meta),
+                        "vector": None,
+                        "distance": None,
                     })
 
                 return results
@@ -510,7 +513,7 @@ class PgVectorStore:
         ids: List[str],
         vectors: Optional[Union[List[np.ndarray], np.ndarray]] = None,
         metadata: Optional[List[Dict[str, Any]]] = None,
-    ) -> bool:
+    ) -> List[str]:
         """
         Update existing vectors.
 
@@ -520,14 +523,16 @@ class PgVectorStore:
             metadata: Optional new metadata
 
         Returns:
-            True if successful
+            IDs the UPDATE matched, in request order and without
+            duplicates. Missing IDs are omitted. An empty request
+            returns an empty list.
 
         Raises:
             ValidationError: If input dimensions don't match
             ProcessingError: If database operation fails
         """
         if not ids:
-            return True
+            return []
 
         if vectors is None and metadata is None:
             raise ValidationError("Either vectors or metadata must be provided for update")
@@ -544,6 +549,8 @@ class PgVectorStore:
         with self._get_connection() as conn:
             try:
                 cur = conn.cursor()
+                confirmed_ids: List[str] = []
+                seen = set()
 
                 for i, vec_id in enumerate(ids):
                     updates = []
@@ -563,7 +570,8 @@ class PgVectorStore:
                         updates.append(psycopg_sql.SQL("metadata = %s"))
                         params.append(json.dumps(metadata[i]))
 
-                    # Build safe UPDATE query
+                    # Build safe UPDATE query. rowcount is read on this
+                    # statement so a mixed batch can name the matched ids.
                     update_sql = psycopg_sql.SQL("""
                         UPDATE {}
                         SET {}
@@ -574,11 +582,14 @@ class PgVectorStore:
                     )
                     params.append(vec_id)
                     cur.execute(update_sql, params)
+                    if cur.rowcount > 0 and vec_id not in seen:
+                        seen.add(vec_id)
+                        confirmed_ids.append(vec_id)
 
                 conn.commit()
                 cur.close()
-                self.logger.info(f"Updated {len(ids)} vectors")
-                return True
+                self.logger.info(f"Updated {len(confirmed_ids)} of {len(ids)} vectors")
+                return confirmed_ids
             except (ValidationError, ProcessingError):
                 conn.rollback()
                 raise
@@ -630,6 +641,184 @@ class PgVectorStore:
                 raise
             except Exception as e:
                 raise ProcessingError("Failed to get vectors") from e
+
+    def get_vector(self, vector_id: str) -> Optional[np.ndarray]:
+        """Get vector by ID."""
+        try:
+            results = self.get([vector_id])
+            if results and len(results) > 0:
+                return results[0].get("vector")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to get vector {vector_id}: {e}")
+            return None
+
+    def get_metadata(self, vector_id: str) -> Optional[Dict[str, Any]]:
+        """Get metadata by ID."""
+        try:
+            results = self.get([vector_id])
+            if results and len(results) > 0:
+                return results[0].get("metadata")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to get metadata for {vector_id}: {e}")
+            return None
+
+    def scan_vectors(self, offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Page through stored vectors ordered by id.
+
+        Args:
+            offset: Number of rows to skip
+            limit: Maximum number of rows to return
+
+        Returns:
+            List of result dicts with 'id', 'metadata', and 'vector'
+        """
+        if not PSYCOPG3_AVAILABLE and not PSYCOPG2_AVAILABLE:
+            raise ProcessingError(
+                "Neither psycopg3 nor psycopg2 is available. "
+                "Install with: pip install psycopg[binary] or psycopg2-binary"
+            )
+
+        if limit <= 0:
+            return []
+
+        scan_sql = psycopg_sql.SQL("""
+            SELECT id, vector, metadata
+            FROM {}
+            ORDER BY id
+            LIMIT %s OFFSET %s
+        """).format(psycopg_sql.Identifier(self.table_name))
+
+        with self._get_connection() as conn:
+            try:
+                cur = conn.cursor()
+                cur.execute(scan_sql, (limit, offset))
+                rows = cur.fetchall()
+                cur.close()
+
+                results = []
+                for row in rows:
+                    vec_id, vec, meta = row
+                    results.append({
+                        "id": vec_id,
+                        "metadata": meta if isinstance(meta, dict) else json.loads(meta) if meta else {},
+                        "vector": np.array(vec) if vec is not None else None,
+                    })
+                return results
+            except Exception as e:
+                raise ProcessingError(f"Failed to scan vectors: {str(e)}") from e
+
+    def filter_by_metadata(
+        self, filters: Dict[str, Any], limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter stored vectors by metadata using PostgreSQL JSONB queries.
+
+        Args:
+            filters: Dictionary of metadata filter conditions
+            limit: Maximum number of results
+
+        Returns:
+            List of results containing id, metadata, and vector
+        """
+        if not PSYCOPG3_AVAILABLE and not PSYCOPG2_AVAILABLE:
+            raise ProcessingError(
+                "Neither psycopg3 nor psycopg2 is available. "
+                "Install with: pip install psycopg[binary] or psycopg2-binary"
+            )
+
+        filter_conditions = []
+        filter_values = []
+
+        if filters:
+            for key, value in filters.items():
+                if not self._is_safe_identifier(key):
+                    raise ValidationError(
+                        f"Invalid filter key: {key!r}. "
+                        "Keys must be alphanumeric with underscores/hyphens only."
+                    )
+                if isinstance(value, dict):
+                    if "min" in value and value["min"] is not None:
+                        filter_conditions.append(psycopg_sql.SQL("(metadata->>{})::numeric >= %s").format(
+                            psycopg_sql.Literal(key)
+                        ))
+                        filter_values.append(value["min"])
+                    if "max" in value and value["max"] is not None:
+                        filter_conditions.append(psycopg_sql.SQL("(metadata->>{})::numeric <= %s").format(
+                            psycopg_sql.Literal(key)
+                        ))
+                        filter_values.append(value["max"])
+                elif isinstance(value, list):
+                    # Same lowercase-bool rule as the scalar branch below: ->> renders
+                    # JSON booleans as 'true'/'false', not str()'s 'True'/'False'.
+                    str_values = [
+                        ('true' if v else 'false') if isinstance(v, bool) else str(v)
+                        for v in value
+                    ]
+                    # If the metadata value at this key is itself a JSON array, match on
+                    # intersection (mirrors the in-memory backend's set-intersection
+                    # semantics) via the jsonb `?|` "any array element matches" operator;
+                    # otherwise fall back to plain scalar membership. `->>` renders an
+                    # array as its whole text representation, so it cannot be reused for
+                    # the array case.
+                    filter_conditions.append(psycopg_sql.SQL(
+                        "(CASE WHEN jsonb_typeof(metadata->{0}) = 'array' "
+                        "THEN metadata->{0} ?| %s "
+                        "ELSE metadata->>{0} = ANY(%s) END)"
+                    ).format(psycopg_sql.Literal(key)))
+                    filter_values.append(str_values)
+                    filter_values.append(str_values)
+                elif isinstance(value, bool):
+                    # PostgreSQL JSONB ->> returns lowercase 'true'/'false' for JSON booleans.
+                    # str(True)='True' and str(False)='False' would never match; use the
+                    # correct lowercase text that ->> actually produces.
+                    filter_conditions.append(psycopg_sql.SQL("metadata->>{} = %s").format(
+                        psycopg_sql.Literal(key)
+                    ))
+                    filter_values.append('true' if value else 'false')
+                else:
+                    filter_conditions.append(psycopg_sql.SQL("metadata->>{} = %s").format(
+                        psycopg_sql.Literal(key)
+                    ))
+                    filter_values.append(str(value))
+
+        if filter_conditions:
+            where_clause = psycopg_sql.SQL(" WHERE ") + psycopg_sql.SQL(" AND ").join(filter_conditions)
+        else:
+            where_clause = psycopg_sql.SQL("")
+
+        query_sql = psycopg_sql.SQL("""
+            SELECT id, vector, metadata
+            FROM {table}
+            {where}
+            LIMIT %s
+        """).format(
+            table=psycopg_sql.Identifier(self.table_name),
+            where=where_clause
+        )
+        params = filter_values + [limit]
+
+        with self._get_connection() as conn:
+            try:
+                cur = conn.cursor()
+                cur.execute(query_sql, params)
+                rows = cur.fetchall()
+                cur.close()
+
+                results = []
+                for row in rows:
+                    vec_id, vector_data, meta = row
+                    vec = np.array(vector_data) if vector_data is not None else None
+                    results.append({
+                        "id": vec_id,
+                        "metadata": meta if isinstance(meta, dict) else json.loads(meta) if meta else {},
+                        "vector": vec
+                    })
+                return results
+            except Exception as e:
+                raise ProcessingError(f"Failed to filter vectors by metadata: {str(e)}") from e
 
     def create_index(
         self,
@@ -814,6 +1003,15 @@ class PgVectorStore:
                 raise
             except Exception as e:
                 raise ProcessingError("Failed to get stats") from e
+
+    def count(self) -> int:
+        """Return the exact number of vectors stored in this PostgreSQL table.
+
+        Executes ``SELECT COUNT(*) FROM <table>`` — always reflects the
+        committed state of the table, including any deletes or updates.
+        """
+        stats = self.get_stats()
+        return int(stats["vector_count"])
 
     def close(self):
         """Close the connection pool."""

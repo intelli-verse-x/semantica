@@ -387,7 +387,12 @@ class SQLiteVecStore:
 
         where_clause = ""
         if filter_conditions:
-            where_clause = " AND " + " AND ".join(filter_conditions)
+            # vec0 filters auxiliary columns after selecting the k neighbors.
+            # Restrict candidate IDs first so k counts matching vectors.
+            where_clause = (
+                f" AND id IN (SELECT id FROM {self.table_name} "
+                f"WHERE {' AND '.join(filter_conditions)})"
+            )
 
         search_sql = f"""
             SELECT id, distance, metadata
@@ -414,6 +419,8 @@ class SQLiteVecStore:
                             "id": vec_id,
                             "score": similarity,
                             "metadata": json.loads(meta_json) if meta_json else {},
+                            "vector": None,
+                            "distance": None,
                         }
                     )
 
@@ -466,7 +473,7 @@ class SQLiteVecStore:
         ids: List[str],
         vectors: Optional[Union[List[np.ndarray], np.ndarray]] = None,
         metadata: Optional[List[Dict[str, Any]]] = None,
-    ) -> bool:
+    ) -> List[str]:
         """
         Update existing vectors.
 
@@ -476,14 +483,16 @@ class SQLiteVecStore:
             metadata: Optional new metadata
 
         Returns:
-            True if successful
+            IDs the UPDATE matched, in request order and without
+            duplicates. Missing IDs are omitted. An empty request
+            returns an empty list.
 
         Raises:
             ValidationError: If input dimensions or lengths don't match
             ProcessingError: If read-only mode is active or database operation fails
         """
         if not ids:
-            return True
+            return []
 
         if self.read_only:
             raise ProcessingError("Cannot update vectors in read-only mode")
@@ -511,8 +520,9 @@ class SQLiteVecStore:
             try:
                 cur = conn.cursor()
 
-                # Same columns are updated for every row, so build one
-                # statement and batch it via executemany for efficiency.
+                # Same columns are updated for every row. Execute one
+                # statement per id: vec0 virtual tables reject UPDATE
+                # RETURNING, and executemany reports only a combined count.
                 if vectors is not None and metadata is not None:
                     update_sql = f"UPDATE {self.table_name} SET embedding = ?, metadata = ? WHERE id = ?"
                     data_tuples = [
@@ -531,11 +541,18 @@ class SQLiteVecStore:
                         (json.dumps(metadata[i]), vec_id) for i, vec_id in enumerate(ids)
                     ]
 
-                cur.executemany(update_sql, data_tuples)
+                confirmed_ids: List[str] = []
+                seen = set()
+                for params in data_tuples:
+                    cur.execute(update_sql, params)
+                    vec_id = params[-1]
+                    if cur.rowcount > 0 and vec_id not in seen:
+                        seen.add(vec_id)
+                        confirmed_ids.append(vec_id)
                 conn.commit()
                 cur.close()
-                self.logger.info(f"Updated {len(ids)} vectors")
-                return True
+                self.logger.info(f"Updated {len(confirmed_ids)} of {len(ids)} vectors")
+                return confirmed_ids
             except ValidationError:
                 conn.rollback()
                 raise
@@ -592,6 +609,161 @@ class SQLiteVecStore:
             except Exception as e:
                 raise ProcessingError("Failed to get vectors") from e
 
+    def get_vector(self, vector_id: str) -> Optional[np.ndarray]:
+        """Get vector by ID."""
+        try:
+            results = self.get([vector_id])
+            if results and len(results) > 0:
+                return results[0].get("vector")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to get vector {vector_id}: {e}")
+            return None
+
+    def get_metadata(self, vector_id: str) -> Optional[Dict[str, Any]]:
+        """Get metadata by ID."""
+        try:
+            results = self.get([vector_id])
+            if results and len(results) > 0:
+                return results[0].get("metadata")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to get metadata for {vector_id}: {e}")
+            return None
+
+    def scan_vectors(self, offset: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Page through stored vectors ordered by id.
+
+        Args:
+            offset: Number of rows to skip
+            limit: Maximum number of rows to return
+
+        Returns:
+            List of result dicts with 'id', 'metadata', and 'vector'
+        """
+        if limit <= 0:
+            return []
+
+        query_sql = f"""
+            SELECT id, embedding, metadata
+            FROM {self.table_name}
+            ORDER BY id
+            LIMIT ? OFFSET ?
+        """
+
+        with self._lock, self._get_connection() as conn:
+            try:
+                cur = conn.cursor()
+                cur.execute(query_sql, (limit, offset))
+                rows = cur.fetchall()
+                cur.close()
+
+                results = []
+                for row in rows:
+                    vec_id, embedding_blob, meta_json = row
+                    vec = None
+                    if embedding_blob:
+                        vec = np.frombuffer(embedding_blob, dtype=np.float32).copy()
+                    results.append({
+                        "id": vec_id,
+                        "metadata": json.loads(meta_json) if meta_json else {},
+                        "vector": vec,
+                    })
+                return results
+            except Exception as e:
+                raise ProcessingError(f"Failed to scan vectors: {str(e)}") from e
+
+    def filter_by_metadata(
+        self, filters: Dict[str, Any], limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter stored vectors by metadata using SQLite JSON functions.
+
+        Args:
+            filters: Dictionary of metadata filter conditions
+            limit: Maximum number of results
+
+        Returns:
+            List of results containing id, metadata, and vector
+        """
+        filter_conditions = []
+        filter_params = []
+
+        if filters:
+            for key, value in filters.items():
+                if not self._is_safe_identifier(key):
+                    raise ValidationError(
+                        f"Invalid filter key: {key!r}. "
+                        "Keys must start with a letter or underscore and contain "
+                        "only alphanumeric characters and underscores."
+                    )
+                if isinstance(value, dict):
+                    if "min" in value and value["min"] is not None:
+                        filter_conditions.append(f"CAST(json_extract(metadata, '$.{key}') AS NUMERIC) >= ?")
+                        filter_params.append(value["min"])
+                    if "max" in value and value["max"] is not None:
+                        filter_conditions.append(f"CAST(json_extract(metadata, '$.{key}') AS NUMERIC) <= ?")
+                        filter_params.append(value["max"])
+                elif isinstance(value, list):
+                    # If the metadata value at this key is itself a JSON array, match on
+                    # intersection (mirrors the in-memory backend's set-intersection
+                    # semantics); otherwise fall back to plain scalar membership. Both
+                    # cases are handled uniformly via json_each: a non-array value is
+                    # wrapped in a one-element array first so json_each always sees a
+                    # valid JSON array to iterate.
+                    placeholders = ", ".join(["?"] * len(value))
+                    filter_conditions.append(
+                        f"EXISTS (SELECT 1 FROM json_each("
+                        f"  CASE WHEN json_type(metadata, '$.{key}') = 'array'"
+                        f"       THEN json_extract(metadata, '$.{key}')"
+                        f"       ELSE json_array(json_extract(metadata, '$.{key}'))"
+                        f"  END"
+                        f") je WHERE je.value IN ({placeholders}))"
+                    )
+                    filter_params.extend([str(v) if not isinstance(v, (int, float, bool)) else v for v in value])
+                else:
+                    filter_conditions.append(f"json_extract(metadata, '$.{key}') = ?")
+                    if isinstance(value, bool):
+                        filter_params.append(1 if value else 0)
+                    else:
+                        filter_params.append(value)
+
+        where_clause = ""
+        if filter_conditions:
+            where_clause = " WHERE " + " AND ".join(filter_conditions)
+
+        query_sql = f"""
+            SELECT id, embedding, metadata
+            FROM {self.table_name}
+            {where_clause}
+            LIMIT ?
+        """
+        params = filter_params + [limit]
+
+        with self._lock, self._get_connection() as conn:
+            try:
+                cur = conn.cursor()
+                cur.execute(query_sql, params)
+                rows = cur.fetchall()
+                cur.close()
+
+                results = []
+                for row in rows:
+                    vec_id, embedding_blob, meta_json = row
+                    vec = None
+                    if embedding_blob:
+                        vec = np.frombuffer(embedding_blob, dtype=np.float32).copy()
+
+                    results.append({
+                        "id": vec_id,
+                        "metadata": json.loads(meta_json) if meta_json else {},
+                        "vector": vec
+                    })
+                return results
+            except Exception as e:
+                raise ProcessingError(f"Failed to filter by metadata: {str(e)}") from e
+
     def create_index(
         self,
         index_type: str = "hnsw",
@@ -625,6 +797,15 @@ class SQLiteVecStore:
                 }
             except Exception as e:
                 raise ProcessingError("Failed to get store statistics") from e
+
+    def count(self) -> int:
+        """Return the exact number of vectors stored in this SQLite table.
+
+        Executes ``SELECT COUNT(*) FROM <table>`` under the store's lock to
+        guarantee a consistent, transaction-aware result.
+        """
+        stats = self.get_stats()
+        return int(stats["vector_count"])
 
     def close(self):
         """Close the database connection."""

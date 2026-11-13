@@ -2,15 +2,10 @@
 Shared Pydantic schemas for the Semantica Knowledge Explorer API.
 """
 
-from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, Field
-
-
-class ErrorResponse(BaseModel):
-    detail: str
-    status_code: int = 500
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class NodeResponse(BaseModel):
@@ -144,6 +139,37 @@ class DecisionResponse(BaseModel):
     timestamp: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _normalize_timestamp(cls, value: Any) -> Optional[str]:
+        """Accept the epoch floats ContextGraph.record_decision() writes.
+
+        Decision nodes store ``timestamp`` as ``datetime.now().timestamp()``, a
+        float, so passing the stored value through unconverted fails validation
+        and turns every decision route into a 500. Normalize to ISO-8601 here so
+        the wire format stays a single string type whatever the producer wrote.
+        """
+        if value is None or isinstance(value, str):
+            return value
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            import math
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"timestamp must be a finite number, got {value!r}"
+                )
+            try:
+                return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+            except (OverflowError, OSError) as exc:
+                raise ValueError(
+                    f"timestamp {value!r} is out of the representable epoch range"
+                ) from exc
+        raise ValueError(
+            f"timestamp must be None, a string, a datetime, or a numeric epoch; "
+            f"got {type(value).__name__!r}"
+        )
+
 
 class CausalChainResponse(BaseModel):
     decision_id: str
@@ -154,12 +180,6 @@ class ComplianceResponse(BaseModel):
     decision_id: str
     compliant: bool = True
     violations: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class TemporalSnapshotResponse(BaseModel):
-    timestamp: str
-    active_nodes: List[NodeResponse]
-    active_node_count: int
 
 
 class TemporalDiffResponse(BaseModel):
@@ -174,7 +194,9 @@ class TemporalPatternResponse(BaseModel):
 
 
 class EnrichExtractRequest(BaseModel):
-    text: str
+    # 10 000 characters is sufficient for a substantial document paragraph while
+    # preventing unbounded spaCy NLP processing on arbitrarily large payloads.
+    text: str = Field(..., max_length=10_000)
 
 
 class EnrichExtractResponse(BaseModel):
@@ -198,8 +220,88 @@ class DedupRequest(BaseModel):
     threshold: float = Field(default=0.8, ge=0.0, le=1.0)
 
 
+class DuplicatePair(BaseModel):
+    """One flagged duplicate pair, in the shape the Entity Resolution tab reads.
+
+    ``DuplicateDetector`` emits ``DuplicateCandidate`` fields (``entity1`` /
+    ``entity2`` / ``similarity_score`` / ``confidence``), while
+    ``EntityResolutionTab.tsx::parseDuplicates`` reads ``entity_a`` /
+    ``entity_b`` / ``similarity``-or-``score``. Issue #1585 shipped because
+    those key sets were disjoint and ``DedupResponse.duplicates`` was an
+    untyped ``List[Dict[str, Any]]``, so nothing failed at the API boundary
+    and the UI rendered empty ids with a 0% score bar.
+
+    Both spellings travel on the wire: the canonical keys the UI parses are
+    required, and their legacy twins are mirrored so clients written against
+    the pre-#1586 shape keep resolving. A producer that emits neither
+    spelling now fails validation loudly instead of silently degrading.
+
+    Detector extras such as ``reasons`` and ``metadata`` pass through
+    untouched via ``extra="allow"``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    entity_a: Union[str, Dict[str, Any]]
+    entity_b: Union[str, Dict[str, Any]]
+    similarity: float
+    score: float
+
+    # Legacy DuplicateCandidate spellings, mirrored from the canonical keys
+    # above so pre-#1586 consumers keep working.
+    entity1: Optional[Union[str, Dict[str, Any]]] = None
+    entity2: Optional[Union[str, Dict[str, Any]]] = None
+    similarity_score: Optional[float] = None
+    confidence: Optional[float] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _mirror_pair_aliases(cls, data: Any) -> Any:
+        """Fill each canonical key from its legacy twin, and vice versa.
+
+        Runs before field validation so a payload carrying either spelling
+        satisfies the required canonical fields. A payload carrying neither
+        leaves them unset and fails validation, which is the point.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        pair = dict(data)
+
+        def _coalesce(*keys: str) -> Any:
+            for key in keys:
+                value = pair.get(key)
+                if value is not None:
+                    return value
+            return None
+
+        entity_a = _coalesce("entity_a", "entity1")
+        entity_b = _coalesce("entity_b", "entity2")
+        # ``similarity`` is the key the UI reads first and ``score`` its
+        # fallback, so cross-fill between the two families: a producer that
+        # emits only one of them still renders a real score bar. When both
+        # are present each keeps its own value.
+        similarity = _coalesce("similarity", "similarity_score", "score", "confidence")
+        score = _coalesce("score", "confidence", "similarity", "similarity_score")
+
+        for key, value in (
+            ("entity_a", entity_a),
+            ("entity1", entity_a),
+            ("entity_b", entity_b),
+            ("entity2", entity_b),
+            ("similarity", similarity),
+            ("similarity_score", similarity),
+            ("score", score),
+            ("confidence", score),
+        ):
+            if pair.get(key) is None and value is not None:
+                pair[key] = value
+
+        return pair
+
+
 class DedupResponse(BaseModel):
-    duplicates: List[Dict[str, Any]] = Field(default_factory=list)
+    duplicates: List[DuplicatePair] = Field(default_factory=list)
     total_flagged: int = 0
 
 
@@ -223,13 +325,6 @@ class ExportRequest(BaseModel):
     node_ids: Optional[List[str]] = None
 
 
-class ExportResponse(BaseModel):
-    format: str
-    content_type: str
-    filename: str
-    size_bytes: int = 0
-
-
 class ImportResponse(BaseModel):
     status: str = "success"
     message: str = "Import successful"
@@ -237,11 +332,6 @@ class ImportResponse(BaseModel):
     edges_added: int = 0
     nodes_imported: Optional[int] = None
     edges_imported: Optional[int] = None
-
-
-class StandardMessageResponse(BaseModel):
-    status: str
-    message: str
 
 
 class AnnotationCreate(BaseModel):
@@ -418,3 +508,39 @@ class DistanceExportRequest(BaseModel):
     include: List[str] = Field(
         default_factory=lambda: ["source_id", "target_id", "hop_count", "distance_band"],
     )
+
+
+class MarkdownResourceRefResponse(BaseModel):
+    kind: Literal["context-node", "agent-memory"]
+    id: str
+
+
+class MarkdownDocumentResponse(BaseModel):
+    resource: MarkdownResourceRefResponse
+    source: str
+    body: str
+    revision: str
+    editable: bool = True
+
+
+class MarkdownApplyRequest(BaseModel):
+    markdown: str
+    expected_revision: str = Field(..., pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class MarkdownApplyResponse(MarkdownDocumentResponse):
+    changed: bool
+
+
+class MemorySummaryResponse(BaseModel):
+    id: str
+    type: str
+    excerpt: str
+    updated_at: Optional[str] = None
+
+
+class MemoryListResponse(BaseModel):
+    items: List[MemorySummaryResponse]
+    total: int
+    skip: int
+    limit: int

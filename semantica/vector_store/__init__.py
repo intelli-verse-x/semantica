@@ -118,7 +118,7 @@ Example Usage:
     >>> # Using convenience functions
     >>> vector_ids = store_vectors(vectors, metadata=metadata_list, method="default")
     >>> results = search_vectors(query_vector, k=10, method="default")
-    >>> hybrid_results = hybrid_search(query_vector, vectors, metadata, vector_ids, filter=filter, method="default")
+    >>> hybrid_results = hybrid_search(query_vector, vectors, metadata, vector_ids, metadata_filter=filter, method="default")
     >>> # Using classes directly
     >>> store = VectorStore(backend="faiss", dimension=768)
     >>> vector_ids = store.store_vectors(vectors, metadata=metadata_list)
@@ -126,7 +126,7 @@ Example Usage:
     >>> from semantica.vector_store import HybridSearch, MetadataFilter
     >>> search = HybridSearch()
     >>> filter = MetadataFilter().eq("category", "science")
-    >>> results = search.search(query_vector, vectors, metadata, vector_ids, filter=filter)
+    >>> results = search.search(query_vector, vectors, metadata, vector_ids, metadata_filter=filter)
 
 Author: Semantica Contributors
 License: MIT
@@ -182,7 +182,7 @@ from .pinecone_store import PineconeStore, PineconeClient, PineconeIndex, Pineco
 from .qdrant_store import QdrantStore, QdrantClient, QdrantCollection, QdrantSearch
 from .registry import MethodRegistry, method_registry
 from .sqlite_vec_store import SQLiteVecStore
-from .vector_store import VectorIndexer, VectorManager, VectorRetriever, VectorStore
+from .vector_store import VectorIndexer, VectorManager, VectorRetriever, VectorStore, SearchResult
 from .weaviate_store import (
     WeaviateStore,
     WeaviateClient,
@@ -196,6 +196,7 @@ __all__ = [
     "VectorIndexer",
     "VectorRetriever",
     "VectorManager",
+    "SearchResult",
     # FAISS
     "FAISSStore",
     "FAISSIndex",

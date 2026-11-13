@@ -8,11 +8,10 @@ import ipaddress
 import logging
 import socket
 import uuid
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
-from typing_extensions import Literal
+from typing import Any, Dict, List, Literal, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -35,6 +34,10 @@ router = APIRouter(prefix="/api/ontology", tags=["ontology"])
 _MAX_FETCH_BYTES = 20 * 1024 * 1024  # 20 MB
 _MAX_ANALYSIS_NODES = 5_000   # cap for health/suggest/shacl node scans to avoid OOM
 _MAX_ENTITIES_PER_SIDE = 500  # per-ontology cap for the O(n²) pairwise suggestion loop
+_GRAPH_TOO_LARGE_DETAIL = (
+    "Ontology editor graph exceeds the maximum size "
+    f"({_MAX_ANALYSIS_NODES} nodes or edges)."
+)
 
 
 class GraphTruncationError(Exception):
@@ -72,6 +75,20 @@ _ONTOLOGY_TYPES = frozenset({
 }) | _SCHEME_TYPES
 
 _SEARCHABLE_TYPES = _CLASS_TYPES | _PROPERTY_TYPES | _INDIVIDUAL_TYPES | _CONCEPT_TYPES | _SCHEME_TYPES
+_SCHEMA_NODE_TYPES = _CLASS_TYPES | _PROPERTY_TYPES | _CONCEPT_TYPES | _ONTOLOGY_TYPES
+_STRUCTURE_EDGE_TYPES = frozenset({
+    "rdf:type",
+    "rdfs:subClassOf",
+    "rdfs:domain",
+    "rdfs:range",
+    "owl:disjointWith",
+    "owl:equivalentClass",
+    "owl:equivalentProperty",
+    "owl:inverseOf",
+    "skos:broader",
+    "skos:narrower",
+    "skos:related",
+})
 
 _URI_PREFIX_MAP = {
     "http://www.w3.org/2002/07/owl#": "owl:",
@@ -226,12 +243,19 @@ class EntityDetailResponse(BaseModel):
     entity_type: str
     definition: Optional[str] = None
     source_ontology: Optional[str] = None
+    owning_ontology: Optional[str] = None
     superclasses: List[str] = Field(default_factory=list)
     subclasses: List[str] = Field(default_factory=list)
     domain: List[str] = Field(default_factory=list)
     range: List[str] = Field(default_factory=list)
     instance_count: int = 0
     properties: Dict[str, Any] = Field(default_factory=dict)
+
+
+class OntologyGraphResponse(BaseModel):
+    uri: str
+    nodes: List[Dict[str, Any]] = Field(default_factory=list)
+    edges: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class SKOSScheme(BaseModel):
@@ -456,10 +480,6 @@ class DraftResponse(BaseModel):
     updated_at: str
 
 
-class ProposalState(BaseModel):
-    state: Literal["draft", "proposed", "approved", "published", "rejected"]
-
-
 class ProposalRequest(BaseModel):
     draft_id: str
     ontology_uri: str
@@ -668,6 +688,7 @@ def _convert_ontology_to_graph(ontology_dict: Dict[str, Any]) -> Tuple[List[Dict
                 "rdfs:label": cls.get("label", cls.get("name", "")),
                 "rdfs:comment": cls.get("description", ""),
                 "uri": cls_uri,
+                "scheme_uri": ontology_uri,
             },
         }
         nodes.append(node)
@@ -684,14 +705,21 @@ def _convert_ontology_to_graph(ontology_dict: Dict[str, Any]) -> Tuple[List[Dict
     # Add property nodes and edges
     for prop in ontology_dict.get("properties", []):
         prop_uri = prop.get("uri", f"temp:prop:{uuid.uuid4().hex[:12]}")
+        property_type = {
+            "object": "owl:ObjectProperty",
+            "data": "owl:DatatypeProperty",
+            "datatype": "owl:DatatypeProperty",
+            "annotation": "owl:AnnotationProperty",
+        }.get(str(prop.get("type", "object")).lower(), "owl:ObjectProperty")
         node = {
             "id": prop_uri,
-            "type": f"owl:{prop.get('type', 'Object').title()}Property",
+            "type": property_type,
             "content": prop.get("name", prop.get("label", "")),
             "properties": {
                 "rdfs:label": prop.get("label", prop.get("name", "")),
                 "rdfs:comment": prop.get("description", ""),
                 "uri": prop_uri,
+                "scheme_uri": ontology_uri,
             },
         }
         nodes.append(node)
@@ -752,14 +780,87 @@ def _node_source_ontology(node: Dict[str, Any]) -> Optional[str]:
     )
 
 
-def _node_belongs_to_ontology(node: Dict[str, Any], ontology_uri: str) -> bool:
+def _node_belongs_to_ontology(
+    node: Dict[str, Any],
+    ontology_uri: str,
+    known_ontology_uris: Optional[set[str]] = None,
+) -> bool:
     nid = node.get("id", "")
     if nid == ontology_uri:
         return True
-    if _node_source_ontology(node) == ontology_uri:
-        return True
+    owner = _node_source_ontology(node)
+    if owner:
+        return owner == ontology_uri
+    if known_ontology_uris:
+        namespace_owners = [
+            candidate
+            for candidate in known_ontology_uris
+            if nid == candidate
+            or nid.startswith(
+                (candidate.rstrip("#/") + "#", candidate.rstrip("#/") + "/")
+            )
+        ]
+        if namespace_owners and max(namespace_owners, key=len) != ontology_uri:
+            return False
     stem = ontology_uri.rstrip("#/")
-    return nid.startswith((stem + "#", stem + "/"))
+    if not nid.startswith((stem + "#", stem + "/")):
+        return False
+    # Prefix ownership only extends to names minted directly in the
+    # ontology's namespace (<stem>#Term or <stem>/Term). Any further
+    # delimiter marks a nested vocabulary (<stem>/child#Term,
+    # <stem>/child/Term), which must not be absorbed into the parent
+    # until it is registered or carries an explicit owner.
+    local_name = nid[len(stem) + 1 :]
+    return "#" not in local_name and "/" not in local_name
+
+
+def _resolve_owning_ontology(
+    node: Dict[str, Any],
+    known_ontology_uris: set[str],
+) -> Optional[str]:
+    """Return the one known ontology that owns this node, or None if none does.
+
+    The most specific (longest) match wins, so a nested vocabulary claims its
+    own terms instead of the parent absorbing them.
+
+    Kept agreeing with _node_belongs_to_ontology by construction — the same
+    three rules in the same order — but in one pass over the candidates rather
+    than one pass per candidate, each of which rescanned the whole set to find
+    the longest namespace. That made resolution quadratic in the number of
+    registered ontologies.
+    """
+    nid = str(node.get("id", ""))
+    if not nid:
+        return None
+
+    # An ontology node owns itself, ahead of any scheme_uri it may carry.
+    if nid in known_ontology_uris:
+        return nid
+
+    # An explicit owner is authoritative even when it is not registered:
+    # naming a different ontology by namespace guess would be worse than
+    # reporting the one the node itself points at.
+    explicit_owner = _node_source_ontology(node)
+    if explicit_owner:
+        return explicit_owner
+
+    longest_namespace: Optional[str] = None
+    for candidate in known_ontology_uris:
+        stem = candidate.rstrip("#/")
+        if not nid.startswith((stem + "#", stem + "/")):
+            continue
+        if longest_namespace is None or len(candidate) > len(longest_namespace):
+            longest_namespace = candidate
+    if longest_namespace is None:
+        return None
+
+    # Prefix ownership only extends to names minted directly in the namespace.
+    # A further delimiter marks a nested vocabulary, which stays unowned until
+    # it is registered or carries an explicit owner.
+    local_name = nid[len(longest_namespace.rstrip("#/")) + 1 :]
+    if "#" in local_name or "/" in local_name:
+        return None
+    return longest_namespace
 
 
 def _is_ontology_entity(node: Dict[str, Any]) -> bool:
@@ -978,8 +1079,18 @@ def _normalize_format(fmt: Optional[str]) -> str:
     return _FORMAT_ALIASES.get(lower, lower)
 
 
-def _validate_fetch_url(url: str) -> None:
-    """Reject non-HTTP(S) schemes and private/loopback/link-local targets."""
+def _validate_fetch_url(url: str) -> List[str]:
+    """Reject non-HTTP(S) schemes and private/loopback/link-local targets.
+
+    Returns every resolved, validated IP address (deduplicated, in
+    resolution order) so the caller can pin the actual connection to them
+    (see _make_pinned_session) with fallback across all of them — not just
+    the first — since a hostname can have multiple A/AAAA records and the
+    first one isn't guaranteed reachable. Resolving the hostname again at
+    connect time would open a DNS check-then-use window (a low-TTL or
+    rebinding DNS answer could differ between this check and the client's
+    own lookup), which is what pinning to these specific addresses avoids.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=422, detail="Only http and https URLs are allowed.")
@@ -990,6 +1101,7 @@ def _validate_fetch_url(url: str) -> None:
         addrinfos = socket.getaddrinfo(hostname, None)
     except socket.gaierror as exc:
         raise HTTPException(status_code=422, detail=f"Cannot resolve hostname '{hostname}': {exc}") from exc
+    validated_ips: List[str] = []
     for _family, _type, _proto, _canonname, sockaddr in addrinfos:
         try:
             ip = ipaddress.ip_address(sockaddr[0])
@@ -1000,28 +1112,161 @@ def _validate_fetch_url(url: str) -> None:
                 status_code=422,
                 detail="Fetching from private, loopback, or reserved network addresses is not allowed.",
             )
+        if sockaddr[0] not in validated_ips:
+            validated_ips.append(sockaddr[0])
+    if not validated_ips:
+        raise HTTPException(status_code=422, detail=f"Cannot resolve hostname '{hostname}' to a usable address.")
+    return validated_ips
+
+
+def _make_pinned_session(pinned_ips: List[str], url: str):
+    """Build a requests.Session whose connection is pinned to pinned_ips
+    (tried in order, falling back on connection failure), regardless of
+    what url's hostname resolves to at connect time.
+
+    _validate_fetch_url() resolves and validates the hostname once; letting
+    the HTTP client resolve it again independently at connect time reopens
+    the exact gap that validation exists to close — a low-TTL or rebinding
+    DNS answer can differ between the two lookups. This pins the pool's
+    connect target to the already-validated addresses directly (bypassing
+    DNS resolution for the connection entirely), while keeping the original
+    hostname as the outgoing HTTP Host header and, for HTTPS, the TLS SNI
+    server_hostname / assert_hostname — otherwise the connection would
+    reach the right IP but present the wrong identity, breaking name-based
+    virtual hosting and (for HTTPS) certificate hostname verification.
+
+    Falls back across every validated address (not just the first) so a
+    hostname with multiple A/AAAA records doesn't fail outright just
+    because the first-returned address happens to be unreachable.
+
+    Note: urllib3's Connection.host is a property that reads/writes the
+    same underlying value as `_dns_host` in this version — it is NOT the
+    separate "presented identity" field it is in some older releases, so
+    overriding just `_dns_host` post-construction (as an earlier version of
+    this fix did) actually changes the Host header too. Pinning the pool's
+    `host` directly and restoring the real hostname via an explicit Host
+    header (+ SNI params for HTTPS) is the correct mechanism here.
+    """
+    import requests as _req
+    import urllib3.util.connection as _u3_connection
+    from urllib3.exceptions import NewConnectionError
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    port = parsed.port
+    default_port = 443 if parsed.scheme == "https" else 80
+    host_header = hostname if port in (None, default_port) else f"{hostname}:{port}"
+
+    class _MultiIPConnectionMixin:
+        """Overrides _new_conn to fall back across every pinned IP in
+        order, instead of urllib3's default single-host connect."""
+
+        def _new_conn(self):
+            last_exc: Optional[BaseException] = None
+            for ip in pinned_ips:
+                try:
+                    return _u3_connection.create_connection(
+                        (ip, self.port),
+                        self.timeout,
+                        source_address=self.source_address,
+                        socket_options=self.socket_options,
+                    )
+                except OSError as exc:
+                    last_exc = exc
+                    continue
+            raise NewConnectionError(
+                self, f"Failed to establish a connection to any of {pinned_ips}: {last_exc}"
+            )
+
+    class _PinnedIPHTTPAdapter(_req.adapters.HTTPAdapter):
+        def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+            # A proxy would perform its own DNS resolution of the target
+            # host on this process's behalf — a resolution outside this
+            # process's visibility or control, so there is no client-side
+            # pin that closes that race. Proxies are disabled outright for
+            # this SSRF-sensitive fetcher (session.trust_env=False below),
+            # so this should be unreachable via environment proxies; fail
+            # closed rather than silently skip pinning if a proxy is
+            # somehow still configured (e.g. passed explicitly in the
+            # future). _validate_fetch_url's destination classification is
+            # a separate, always-enforced check — this only guards the
+            # secondary DNS-pinning hardening.
+            if _req.utils.select_proxy(request.url, proxies):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Proxied requests are not supported for ontology URL fetching.",
+                )
+            host_params, pool_kwargs = self.build_connection_pool_key_attributes(request, verify, cert)
+            if host_params.get("scheme") == "https":
+                pool_kwargs.setdefault("assert_hostname", hostname)
+                pool_kwargs.setdefault("server_hostname", hostname)
+            host_params["host"] = pinned_ips[0]
+            pool = self.poolmanager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+            base_connection_cls = pool.ConnectionCls
+            if not issubclass(base_connection_cls, _MultiIPConnectionMixin):
+                pool.ConnectionCls = type(
+                    "_PinnedConnection", (_MultiIPConnectionMixin, base_connection_cls), {}
+                )
+            return pool
+
+    session = _req.Session()
+    # Never honor HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars for this
+    # SSRF-sensitive fetcher: a configured proxy would perform its own DNS
+    # resolution of the target host outside this process's control,
+    # silently reopening the DNS check-then-use race pinning exists to
+    # close. See _PinnedIPHTTPAdapter.get_connection_with_tls_context for
+    # the fail-closed backstop if a proxy is somehow still configured.
+    session.trust_env = False
+    session.headers["Host"] = host_header
+    adapter = _PinnedIPHTTPAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def _fetch_url_sync(url: str) -> bytes:
-    _validate_fetch_url(url)
-    import requests as _req
+    pinned_ips = _validate_fetch_url(url)
+    _MAX_REDIRECTS = 5
+    current_url = url
     try:
-        resp = _req.get(
-            url,
-            headers={"Accept": "text/turtle, application/rdf+xml, application/ld+json, */*;q=0.1"},
-            timeout=30,
-            stream=True,
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
-        chunks: List[bytes] = []
-        total = 0
-        for chunk in resp.iter_content(65536):
-            total += len(chunk)
-            if total > _MAX_FETCH_BYTES:
-                raise HTTPException(status_code=413, detail="Remote resource exceeds 20 MB limit.")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        for _ in range(_MAX_REDIRECTS + 1):
+            session = _make_pinned_session(pinned_ips, current_url)
+            try:
+                resp = session.get(
+                    current_url,
+                    headers={"Accept": "text/turtle, application/rdf+xml, application/ld+json, */*;q=0.1"},
+                    timeout=30,
+                    stream=True,
+                    allow_redirects=False,  # SECURITY: follow redirects manually
+                )
+                if resp.is_redirect or resp.is_permanent_redirect:
+                    redirect_url = resp.headers.get("Location")
+                    resp.close()  # Release the streamed connection before following the redirect
+                    if not redirect_url:
+                        raise HTTPException(status_code=502, detail="Redirect without Location header.")
+                    # Resolve relative redirects (e.g. /ontology.ttl) against the current URL
+                    redirect_url = urljoin(current_url, redirect_url)
+                    # Re-validate the redirect target to prevent SSRF via
+                    # open-redirect to internal/cloud-metadata endpoints, and
+                    # get fresh pins for the new host.
+                    pinned_ips = _validate_fetch_url(redirect_url)
+                    current_url = redirect_url
+                    continue
+                try:
+                    resp.raise_for_status()
+                    chunks: List[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_content(65536):
+                        total += len(chunk)
+                        if total > _MAX_FETCH_BYTES:
+                            raise HTTPException(status_code=413, detail="Remote resource exceeds 20 MB limit.")
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+                finally:
+                    resp.close()  # Release the streamed connection once fully read (or on error)
+            finally:
+                session.close()
+        raise HTTPException(status_code=502, detail=f"Too many redirects (max {_MAX_REDIRECTS}).")
     except HTTPException:
         raise
     except Exception as exc:
@@ -1081,7 +1326,8 @@ def _parse_rdf_sync(content: bytes, fmt: str) -> tuple:
                     metadata.setdefault("description", str(obj))
             break
 
-    if "uri" not in metadata:
+    synthetic_uri = "uri" not in metadata
+    if synthetic_uri:
         metadata["uri"] = f"urn:semantica:onto:{uuid.uuid4().hex[:8]}"
     metadata.setdefault("name", metadata["uri"].rsplit("/", 1)[-1].rsplit("#", 1)[-1] or "Unnamed")
     metadata["triple_count"] = len(g)
@@ -1126,6 +1372,20 @@ def _parse_rdf_sync(content: bytes, fmt: str) -> tuple:
             "target": str(obj),
             "type": _uri_to_prefix(str(pred)),
             "weight": 1.0,
+        })
+
+    if synthetic_uri:
+        # No owl:Ontology / skos:ConceptScheme declaration exists, so the
+        # synthetic registry URI shares no namespace with any node. Ownership
+        # must be recorded explicitly, and the editor needs a matching graph
+        # node, or the registered ontology resolves to an empty core and 404s.
+        for node in nodes:
+            node["properties"].setdefault("scheme_uri", metadata["uri"])
+        nodes.append({
+            "id": metadata["uri"],
+            "type": "owl:Ontology",
+            "content": metadata["name"],
+            "properties": {"rdfs:label": metadata["name"], "uri": metadata["uri"]},
         })
 
     return nodes, edges, metadata
@@ -1310,15 +1570,15 @@ async def load_ontology(
             ontology_uri = ontology_data.data.get("uri", f"temp:{uuid.uuid4().hex[:12]}")
             registry[ontology_uri] = OntologyEntry(
                 uri=ontology_uri,
-                name=ontology_data.data.get("name", "Imported Ontology"),
-                description=ontology_data.data.get("description"),
+                name=body.name or ontology_data.data.get("name", "Imported Ontology"),
+                description=body.description or ontology_data.data.get("description"),
                 format=fmt,
                 status="external",
                 version=ontology_data.data.get("version", "1.0"),
                 class_count=len([n for n in nodes if n.get("type") in _CLASS_TYPES]),
                 concept_count=len([n for n in nodes if n.get("type") in _CONCEPT_TYPES]),
                 property_count=len([n for n in nodes if n.get("type") in _PROPERTY_TYPES]),
-                loaded_at=datetime.now(UTC).isoformat(),
+                loaded_at=datetime.now(timezone.utc).isoformat(),
                 enabled=True,
                 tags=body.tags,
                 source_url=body.url,
@@ -1326,7 +1586,7 @@ async def load_ontology(
             
             return LoadOntologyResponse(
                 uri=ontology_uri,
-                name=ontology_data.data.get("name", "Imported Ontology"),
+                name=body.name or ontology_data.data.get("name", "Imported Ontology"),
                 nodes_added=nodes_added,
                 edges_added=edges_added,
                 format=fmt,
@@ -1367,15 +1627,15 @@ async def load_ontology(
     ontology_uri = metadata.get("uri", f"temp:{uuid.uuid4().hex[:12]}")
     registry[ontology_uri] = OntologyEntry(
         uri=ontology_uri,
-        name=metadata.get("name", "Imported Ontology"),
-        description=metadata.get("description"),
+        name=body.name or metadata.get("name", "Imported Ontology"),
+        description=body.description or metadata.get("description"),
         format=fmt,
         status="external",
         version=metadata.get("version", "1.0"),
         class_count=sum(1 for n in nodes if n.get("type") in _CLASS_TYPES),
         concept_count=sum(1 for n in nodes if n.get("type") in _CONCEPT_TYPES),
         property_count=sum(1 for n in nodes if n.get("type") in _PROPERTY_TYPES),
-        loaded_at=datetime.now(UTC).isoformat(),
+        loaded_at=datetime.now(timezone.utc).isoformat(),
         enabled=True,
         tags=body.tags,
         source_url=body.url,
@@ -1383,7 +1643,7 @@ async def load_ontology(
 
     return LoadOntologyResponse(
         uri=ontology_uri,
-        name=metadata.get("name", "Imported Ontology"),
+        name=body.name or metadata.get("name", "Imported Ontology"),
         nodes_added=nodes_added,
         edges_added=edges_added,
         format=fmt,
@@ -1574,7 +1834,7 @@ async def create_ontology(
         status="draft",
         version="0.1.0",
         class_count=sum(1 for n in nodes if n.get("type") == "owl:Class"),
-        loaded_at=datetime.now(UTC).isoformat(),
+        loaded_at=datetime.now(timezone.utc).isoformat(),
         enabled=True,
         tags=body.tags,
     )
@@ -1628,9 +1888,128 @@ async def search_entities(
     return results
 
 
+def _known_ontology_uris(
+    session: GraphSession, registry: Dict[str, OntologyEntry]
+) -> set[str]:
+    known = set(registry)
+    for node_type in _ONTOLOGY_TYPES:
+        for node in session.iter_nodes(node_type=node_type):
+            node_id = str(node.get("id", ""))
+            if node_id:
+                known.add(node_id)
+    return known
+
+
+def _collect_core_nodes(
+    session: GraphSession, uri: str, known_ontology_uris: set[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Stream schema nodes, keeping only the ones this ontology owns.
+
+    Filtering as each node arrives makes _MAX_ANALYSIS_NODES bound the work and
+    not merely the response: foreign nodes are discarded instead of materialized,
+    and the scan stops once the owned ones pass the cap. The ownership filter has
+    to stay ahead of that check — thousands of *other* ontologies' nodes must
+    never make this one too large to open. Requesting pages instead would bound
+    nothing: paginate_nodes normalizes the whole matching set on every call.
+    """
+    core_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+    for node_type in _SCHEMA_NODE_TYPES:
+        for node in session.iter_nodes(node_type=node_type):
+            node_id = str(node.get("id", ""))
+            if not node_id or not _node_belongs_to_ontology(
+                node, uri, known_ontology_uris
+            ):
+                continue
+            core_nodes_by_id[node_id] = node
+            if len(core_nodes_by_id) > _MAX_ANALYSIS_NODES:
+                raise GraphTruncationError(_GRAPH_TOO_LARGE_DETAIL)
+    return core_nodes_by_id
+
+
+def _select_structure_edges(
+    session: GraphSession, core_node_ids: set[str]
+) -> List[Dict[str, Any]]:
+    """Stream structural edges, keeping only those leaving a core node.
+
+    The requested ontology may reference outward (e.g. rdfs:range to an external
+    vocabulary), but an unrelated ontology's property pointing at a core class
+    must not leak inward.
+    """
+    selected_edges: List[Dict[str, Any]] = []
+    for edge_type in _STRUCTURE_EDGE_TYPES:
+        for edge in session.iter_edges(edge_type=edge_type):
+            if str(edge.get("source", "")) not in core_node_ids:
+                continue
+            selected_edges.append(edge)
+            if len(selected_edges) > _MAX_ANALYSIS_NODES:
+                raise GraphTruncationError(_GRAPH_TOO_LARGE_DETAIL)
+    return selected_edges
+
+
+@router.get("/graph", response_model=OntologyGraphResponse)
+async def get_ontology_graph(
+    request: Request,
+    uri: str = Query(..., min_length=1),
+    session: GraphSession = Depends(get_session),
+):
+    """Return the editable schema subgraph for one registered ontology."""
+    known_ontology_uris = await asyncio.to_thread(
+        _known_ontology_uris, session, _get_registry(request)
+    )
+    if uri not in known_ontology_uris:
+        raise HTTPException(status_code=404, detail="Ontology not found in registry.")
+
+    try:
+        core_nodes_by_id = await asyncio.to_thread(
+            _collect_core_nodes, session, uri, known_ontology_uris
+        )
+        if not core_nodes_by_id:
+            raise HTTPException(status_code=404, detail="Ontology graph not found.")
+        core_node_ids = set(core_nodes_by_id)
+        selected_edges = await asyncio.to_thread(
+            _select_structure_edges, session, core_node_ids
+        )
+    except GraphTruncationError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    # Invariant: the helpers raise the moment their accumulation passes
+    # _MAX_ANALYSIS_NODES, so core_nodes_by_id and selected_edges are both
+    # within the cap here; a post-filter re-check would be unreachable.
+    external_node_ids = {
+        node_id
+        for edge in selected_edges
+        for node_id in (str(edge.get("source", "")), str(edge.get("target", "")))
+    } - core_node_ids
+    external_nodes = await asyncio.gather(
+        *(asyncio.to_thread(session.get_node, node_id) for node_id in external_node_ids)
+    )
+
+    selected_nodes = list(core_nodes_by_id.values())
+    selected_nodes.extend(node for node in external_nodes if node is not None)
+    selected_nodes.sort(key=lambda node: str(node.get("id", "")))
+    selected_edges.sort(
+        key=lambda edge: (
+            str(edge.get("source", "")),
+            str(edge.get("type", "")),
+            str(edge.get("target", "")),
+            str(edge.get("id", "")),
+        )
+    )
+    # Annotate copies: session node dicts may be cached and shared with other callers.
+    return OntologyGraphResponse(
+        uri=uri,
+        nodes=[
+            {**node, "entity_type": _classify_node_type(node.get("type", ""))}
+            for node in selected_nodes
+        ],
+        edges=selected_edges,
+    )
+
+
 @router.get("/entity/{entity_uri:path}", response_model=EntityDetailResponse)
 async def get_entity_detail(
     entity_uri: str,
+    request: Request,
     session: GraphSession = Depends(get_session),
 ):
     node = await asyncio.to_thread(session.get_node, entity_uri)
@@ -1652,12 +2031,21 @@ async def get_entity_detail(
 
     all_nodes, _ = await asyncio.to_thread(session.get_nodes, skip=0, limit=999_999)
     instance_count = sum(1 for n in all_nodes if n.get("type") == entity_uri)
+    # Ownership must use the same candidate set as /graph, so it goes through the
+    # same helper rather than being derived from all_nodes above: that scan is
+    # capped at 999,999, and on a larger graph a truncated set would silently
+    # drop ontologies and make the two endpoints disagree about who owns a node.
+    # The helper iterates only the ontology node types, so it is not a full scan.
+    known_ontology_uris = await asyncio.to_thread(
+        _known_ontology_uris, session, _get_registry(request)
+    )
 
     return EntityDetailResponse(
         uri=entity_uri, label=label,
         type=ntype, entity_type=_classify_node_type(ntype),
         definition=definition,
         source_ontology=props.get("scheme_uri"),
+        owning_ontology=_resolve_owning_ontology(node, known_ontology_uris),
         superclasses=superclasses, subclasses=subclasses,
         domain=domain, range=range_,
         instance_count=instance_count, properties=props,
@@ -1966,7 +2354,7 @@ async def upsert_alignment(
         or _label_from_uri(body.target_uri)
     )
 
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     store = _get_alignment_store(request)
     alignment_id = _alignment_id(body.source_uri, body.relation, body.target_uri)
     existing = store.get(alignment_id)
@@ -2289,7 +2677,7 @@ async def ontology_health(
         total_score=round(total_score, 1),
         dimensions=dimensions,
         issues=issues[:100],
-        generated_at=datetime.now(UTC).isoformat(),
+        generated_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -2544,7 +2932,7 @@ async def generate_shacl(
         uri=body.uri,
         shacl_turtle=shacl_turtle,
         shape_count=len(shapes),
-        generated_at=datetime.now(UTC).isoformat(),
+        generated_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -2562,7 +2950,7 @@ async def list_shacl_shapes(
         uri=uri,
         shapes=shapes,
         shacl_turtle=shacl_turtle,
-        generated_at=datetime.now(UTC).isoformat(),
+        generated_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -2583,7 +2971,8 @@ async def validate_shacl(
             status="error",
             message=(
                 f"SHACL Turtle size ({len(_shacl_bytes)} bytes) "
-                f"exceeds maximum allowed size ({_MAX_SHACL_TURTLE_BYTES} bytes)."
+                f"exceeds maximum allowed size ({_MAX_SHACL_TURTLE_BYTES} bytes); "
+                f"set SEMANTICA_MAX_SHACL_TURTLE_BYTES to raise the limit."
             ),
             violations=[],
         )
@@ -2600,7 +2989,8 @@ async def validate_shacl(
                 status="error",
                 message=(
                     f"SHACL graph triple count ({len(g)}) "
-                    f"exceeds maximum allowed limit ({_MAX_SHACL_TRIPLES})."
+                    f"exceeds maximum allowed limit ({_MAX_SHACL_TRIPLES}); "
+                    f"set SEMANTICA_MAX_SHACL_TRIPLES to raise the limit."
                 ),
                 violations=[],
             )
@@ -2651,7 +3041,8 @@ async def validate_shacl(
             conforms=False,
             status="error",
             message=(
-                f"SHACL validation timed out after {_MAX_SHACL_TIMEOUT_SECONDS} seconds."
+                f"SHACL validation timed out after {_MAX_SHACL_TIMEOUT_SECONDS} seconds; "
+                f"set SEMANTICA_MAX_SHACL_TIMEOUT to raise the timeout."
             ),
             violations=[],
         )
@@ -2770,9 +3161,14 @@ async def refresh_ontology(
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Refresh parse error: {exc}") from exc
 
-    nodes_added = await asyncio.to_thread(session.add_nodes, nodes)
-    edges_added = await asyncio.to_thread(session.add_edges, edges)
-    entry.loaded_at = datetime.now(UTC).isoformat()
+    try:
+        nodes_added, edges_added = await asyncio.to_thread(
+            session.add_nodes_and_edges, nodes, edges
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    entry.loaded_at = datetime.now(timezone.utc).isoformat()
 
     return RefreshResponse(uri=ontology_uri, nodes_added=nodes_added, edges_added=edges_added)
 
@@ -2789,7 +3185,7 @@ async def save_draft(
     """Stage editor diffs as a draft with ChangeLogEntry metadata."""
     drafts = _get_drafts(request)
     draft_id = f"draft_{uuid.uuid4().hex[:12]}"
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
 
     # Create ChangeLogEntry for audit trail
     try:
@@ -2856,7 +3252,7 @@ async def submit_proposal(
 
     draft = drafts[body.draft_id]
     proposal_id = f"prop_{uuid.uuid4().hex[:12]}"
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
 
     # Compute impact analysis using VersionManager.diff_ontologies and OntologyEngine
     impact_analysis = {}
@@ -3015,7 +3411,7 @@ async def approve_proposal(
         raise HTTPException(status_code=404, detail="Proposal not found.")
     proposal = proposals[proposal_id]
     proposal.state = "approved"
-    proposal.updated_at = datetime.now(UTC).isoformat()
+    proposal.updated_at = datetime.now(timezone.utc).isoformat()
     return {"status": "approved", "proposal_id": proposal_id}
 
 
@@ -3030,7 +3426,7 @@ async def reject_proposal(
         raise HTTPException(status_code=404, detail="Proposal not found.")
     proposal = proposals[proposal_id]
     proposal.state = "rejected"
-    proposal.updated_at = datetime.now(UTC).isoformat()
+    proposal.updated_at = datetime.now(timezone.utc).isoformat()
     return {"status": "rejected", "proposal_id": proposal_id}
 
 
@@ -3094,7 +3490,7 @@ async def publish_proposal(
                 ontology_uri=proposal.ontology_uri,
                 state="published",
                 author=proposal.author,
-                date=datetime.now(UTC).isoformat(),
+                date=datetime.now(timezone.utc).isoformat(),
                 diff_summary=draft.diff.model_dump(),
             )
         )
@@ -3135,7 +3531,7 @@ async def publish_proposal(
         nodes_added += await asyncio.to_thread(session.add_nodes, property_nodes)
 
     proposal.state = "published"
-    proposal.updated_at = datetime.now(UTC).isoformat()
+    proposal.updated_at = datetime.now(timezone.utc).isoformat()
 
     return {
         "status": "published",
@@ -3162,10 +3558,10 @@ async def add_comment(
         "element_uri": body.element_uri,
         "text": body.text,
         "author": body.author,
-        "created_at": datetime.now(UTC).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     proposal.comments.append(comment)
-    proposal.updated_at = datetime.now(UTC).isoformat()
+    proposal.updated_at = datetime.now(timezone.utc).isoformat()
     return {"status": "commented", "comment_id": comment["id"]}
 
 

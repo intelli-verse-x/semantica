@@ -97,7 +97,7 @@ from .semantic_chunker import Chunk
 logger = get_logger("split_methods")
 
 # Try to import optional dependencies
-spacy, SPACY_AVAILABLE = safe_import("spacy")
+_, SPACY_AVAILABLE = safe_import("spacy")
 
 nltk, NLTK_AVAILABLE = safe_import("nltk")
 tiktoken, TIKTOKEN_AVAILABLE = safe_import("tiktoken")
@@ -311,6 +311,9 @@ def split_by_tokens(
             )
         )
 
+        if end_idx >= len(tokens):
+            break
+
         # Move to next chunk with overlap
         start_idx = max(start_idx + 1, end_idx - chunk_overlap)
         text_start = text_end - chunk_overlap * 4  # Approximate
@@ -336,7 +339,8 @@ def split_by_sentences(
     # Try spaCy first
     if SPACY_AVAILABLE and kwargs.get("use_spacy", True):
         try:
-            nlp = spacy.load("en_core_web_sm")
+            from ..semantic_extract.methods import load_spacy_model
+            nlp = load_spacy_model("en_core_web_sm")
             doc = nlp(text)
             sentences = [sent.text for sent in doc.sents]
         except Exception:
@@ -529,6 +533,9 @@ def split_by_characters(
             )
         )
 
+        if end >= text_length:
+            break
+
         start = max(start + 1, end - chunk_overlap)
 
     return chunks
@@ -578,6 +585,9 @@ def split_by_words(
                 },
             )
         )
+
+        if end_idx >= len(words):
+            break
 
         start_idx = max(start_idx + 1, end_idx - chunk_overlap)
 
@@ -1180,7 +1190,9 @@ def split_graph_based(
         )
 
         entities = ner_extractor.extract(text)
-        relations = relation_extractor.extract(text)
+        # Relation extraction requires the extracted entities; failing to pass
+        # them raises and can trigger the broad fallback to recursive splitting.
+        relations = relation_extractor.extract(text, entities)
 
         # Build graph
         G = nx.Graph()
@@ -1399,7 +1411,7 @@ def split_embedding_semantic(
 
 def split_hierarchical(
     text: str,
-    levels: List[str] = ["section", "paragraph", "sentence"],
+    levels: Optional[List[str]] = None,
     chunk_sizes: Optional[List[int]] = None,
     **kwargs,
 ) -> List[Chunk]:
@@ -1417,6 +1429,8 @@ def split_hierarchical(
     """
     if chunk_sizes is None:
         chunk_sizes = [2000, 1000, 500]
+    if levels is None:
+        levels = ["section", "paragraph", "sentence"]
 
     # Start with largest level
     if "section" in levels:
@@ -1606,9 +1620,13 @@ def split_sliding_window(
     Args:
         text: Input text
         chunk_size: Chunk size in characters
-        overlap: Overlap size in characters
-        stride: Stride size (default: chunk_size - overlap)
-        preserve_boundaries: Whether to preserve word/sentence boundaries
+        overlap: Character overlap, or the maximum character budget for complete
+            trailing sentences when preserve_boundaries is True
+        stride: Character-window step (default: chunk_size - overlap). Applies
+            to fixed windows and long-sentence fallback, not sentence grouping.
+            Long-sentence fallback caps the step at chunk_size to avoid gaps.
+        preserve_boundaries: Group complete sentences and repeat only whole
+            trailing sentences that fit both the overlap budget and chunk_size
         **kwargs: Additional options
 
     Returns:
@@ -1623,8 +1641,9 @@ def split_sliding_window(
         )
 
     try:
+        effective_stride = stride if stride is not None else (chunk_size - overlap)
         chunker = SlidingWindowChunker(
-            chunk_size=chunk_size, overlap=overlap, stride=stride, **kwargs
+            chunk_size=chunk_size, overlap=overlap, stride=effective_stride, **kwargs
         )
         return chunker.chunk(text, preserve_boundaries=preserve_boundaries, **kwargs)
     except Exception as e:
