@@ -5,7 +5,7 @@ permissions:
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'org-sync/upstream-*']
     paths-ignore:
       - 'docs/**'
       - 'docs_check.py'
@@ -22,6 +22,7 @@ jobs:
   # this job, so the push optimization is unaffected.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     # Only needed for pull_request events; push events are pre-filtered above.
     if: github.event_name == 'pull_request'
     outputs:
@@ -29,6 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           # Fetch enough history to compute the merge base against the PR base.
           fetch-depth: 0
       - name: Check for source changes
@@ -70,8 +72,11 @@ jobs:
         needs.changes.outputs.src == 'true'
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
